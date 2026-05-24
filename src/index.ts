@@ -50,8 +50,9 @@ export { h2 } from "./h2.js";
 export { Server, createServer } from "./server.js";
 export type { ServerConfig, HttpRequest, HttpResponse, RequestHandler } from "./server.js";
 
-// Types for CNO secondary wrapping layer
-export type ProgressCallback = (now: number, total: number) => void;
+// Fetch (sync + async)
+export { fetchBytes, fetchSync, fetchText, fetchBytesAsync, fetchAsync, fetchTextAsync } from "./fetch.js";
+export type { ProgressCallback, FetchOptions } from "./fetch.js";
 
 // Utilities
 export { hexDump } from "./debug.js";

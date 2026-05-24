@@ -1,1 +1,1 @@
-export default import.meta.use('http2');
+export default import.meta.use('ext:h2');

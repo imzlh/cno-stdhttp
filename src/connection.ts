@@ -6,6 +6,9 @@
  *
  * This module does NOT know about HTTP — it just manages raw TCP/TLS connections.
  * Protocol negotiation (H1 vs H2 vs H3) happens at the protocol layer.
+ *
+ * Generator-based I/O: logic expressed as generators yielding IOOp,
+ * dispatched by syncDriver (readSync/writeSync) or asyncDriver (await).
  */
 
 const os = import.meta.use("os");
@@ -13,10 +16,10 @@ const timers = import.meta.use("timers");
 const asfs = import.meta.use("asyncfs");
 const engine = import.meta.use("engine");
 const ssl = import.meta.use("ssl");
-const dns = import.meta.use("dns");
 const windows = import.meta.use("win32");
+const fs = import.meta.use("fs");
+const streams = import.meta.use("streams");
 
-import { TcpSocket } from "./socket";
 import { dnsCache } from "./dns-cache";
 
 function assert(condition: unknown, message?: string): asserts condition {
@@ -24,6 +27,21 @@ function assert(condition: unknown, message?: string): asserts condition {
 }
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
+// ---------------------------------------------------------------------------
+// IO Operation type — generators yield these, drivers dispatch
+// ---------------------------------------------------------------------------
+
+interface IORead  { tag: 'read';  buf: Uint8Array }
+interface IOWrite { tag: 'write'; data: Uint8Array }
+type IOOp = IORead | IOWrite;
+
+function ioRead(buf: Uint8Array): IORead  { return { tag: 'read', buf }; }
+function ioWrite(data: Uint8Array): IOWrite { return { tag: 'write', data }; }
+
+// ---------------------------------------------------------------------------
+// ConnectionConfig / ConnectionState / ConnectionLike
+// ---------------------------------------------------------------------------
 
 export interface ConnectionConfig {
     hostname: string;
@@ -49,11 +67,13 @@ export interface ConnectionLike {
     state:    ConnectionState;
     lastUsed: number;
     requests: number;
-    connect(): Promise<void>;
-    write(data: Uint8Array): Promise<void>;
-    read(size?: number): Promise<Uint8Array | null>;
-    onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
-    stopReading(): void;
+    isSync:   boolean;
+    connect(): void;
+    connectAsync(): Promise<void>;
+    write(data: Uint8Array): void;
+    writeAsync(data: Uint8Array): Promise<void>;
+    read(size?: number, waitForData?: boolean): Uint8Array | null;
+    readAsync(size?: number, waitForData?: boolean): Promise<Uint8Array | null>;
     markActive(): void;
     markIdle(): void;
     close(): void;
@@ -80,6 +100,64 @@ async function generateWindowsCaBundle(): Promise<string | null> {
         await fh.close();
         return tmp;
     } catch { return null; }
+}
+
+function findSystemCaPathSync(): string | null {
+    const sysname = os.uname().sysname;
+
+    if (sysname === "Windows_NT") {
+        if (windowsCaCache) return windowsCaCache;
+        if (!windowsCaPromise) {
+            windowsCaPromise = generateWindowsCaBundle().then(result => {
+                windowsCaCache = result; windowsCaPromise = null; return result;
+            });
+        }
+        return engine.waitPromise(windowsCaPromise);
+    }
+
+    const candidates: string[] = (() => {
+        switch (sysname) {
+            case "Linux": return [
+                "/etc/ssl/certs/ca-certificates.crt",
+                "/etc/pki/tls/certs/ca-bundle.crt",
+                "/etc/pki/tls/cert.pem",
+                "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                "/etc/ssl/cert.pem",
+                "/etc/ssl/ca-bundle.pem",
+                "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+                "/etc/ssl/ca-bundle.pem",
+                "/etc/ca-certificates.crt",
+                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+            ];
+            case "Darwin": return [
+                "/etc/ssl/cert.pem",
+                "/usr/local/etc/openssl/cert.pem",
+                "/opt/homebrew/etc/openssl/cert.pem",
+                "/opt/homebrew/etc/openssl@3/cert.pem",
+                "/usr/local/etc/openssl@3/cert.pem",
+                "/System/Library/OpenSSL/certs",
+            ];
+            case "FreeBSD": return [
+                "/usr/local/share/certs/ca-root-nss.crt",
+                "/usr/local/openssl/cert.pem",
+                "/etc/ssl/cert.pem",
+            ];
+            case "OpenBSD": return [
+                "/etc/ssl/cert.pem",
+                "/usr/local/share/cert.pem",
+            ];
+            default: return [];
+        }
+    })();
+
+    for (const path of candidates) {
+        try {
+            const stat = fs.stat(path);
+            if (stat.isFile) return path;
+            if (stat.isDirectory && path.includes("certs")) return path;
+        } catch { /* not found */ }
+    }
+    return null;
 }
 
 export async function findSystemCaPath(): Promise<string | null> {
@@ -144,21 +222,77 @@ export async function findSystemCaPath(): Promise<string | null> {
 /* Single Connection                                                  */
 /* ------------------------------------------------------------------ */
 
-export class Connection extends TcpSocket implements ConnectionLike {
-    public state:    ConnectionState = ConnectionState.CONNECTING;
-    public lastUsed: number          = Date.now();
-    public requests: number          = 0;
-    public onClose:  (() => void) | null = null;
+export class Connection implements ConnectionLike {
+    public socket:   CModuleStreams.TCP;
+    public sslPipe:  CModuleSSL.Pipe | null = null;
+    public state:    ConnectionState        = ConnectionState.CONNECTING;
+    public lastUsed: number                 = Date.now();
+    public requests: number                 = 0;
+    public onClose:  (() => void) | null    = null;
+    public isSync:   boolean                = false;
 
     private idleTimer: number | null = null;
     private config: ConnectionConfig;
+    private pendingCiphertext: Uint8Array | null = null;
 
     constructor(cfg: ConnectionConfig) {
-        super();
         this.config = cfg;
+        this.socket = new streams.TCP();
     }
 
-    async connect(): Promise<void> {
+    // -----------------------------------------------------------------------
+    // Connect (sync) — uses connectSync + readSync/writeSync
+    // -----------------------------------------------------------------------
+
+    connect(): void {
+        try {
+            this.isSync = true;
+            const isSecure = this.config.protocol === "https:";
+
+            if (this.config.client) {
+                this.socket = engine.waitPromise(
+                    this.config.client.connect(this.config.hostname, this.config.port, isSecure)
+                );
+            } else {
+                const addrs = dnsCache.resolveSync(this.config.hostname, os.AF_UNSPEC);
+                if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.config.hostname}`);
+                const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
+                assert(addr, `No IP address found for ${this.config.hostname}`);
+                this.socket.connectSync({ ip: addr.ip, port: this.config.port });
+            }
+
+            if (isSecure) {
+                const clientCtx = this.config.client?.getSSLContext();
+                if (clientCtx) {
+                    this.syncDriver(this.performTLSHandshake(clientCtx, this.config.hostname));
+                } else {
+                    const caPath = findSystemCaPathSync();
+                    if (!caPath) throw new Error("No system CA bundle found - cannot verify TLS certificates.");
+                    const ctx = new ssl.Context({ mode: "client", verify: true, ca: caPath });
+                    this.syncDriver(this.performTLSHandshake(ctx, this.config.hostname));
+                }
+            }
+
+            this.socket.onclose = () => {
+                if (this.state === ConnectionState.CLOSED) return;
+                this.stopIdleTimer();
+                this.state = ConnectionState.CLOSED;
+                this.onClose?.();
+            };
+
+            this.state = ConnectionState.IDLE;
+            this.startIdleTimer();
+        } catch (err) {
+            this.state = ConnectionState.CLOSED;
+            throw err;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Connect (async)
+    // -----------------------------------------------------------------------
+
+    async connectAsync(): Promise<void> {
         try {
             const isSecure = this.config.protocol === "https:";
 
@@ -177,12 +311,12 @@ export class Connection extends TcpSocket implements ConnectionLike {
             if (isSecure) {
                 const clientCtx = this.config.client?.getSSLContext();
                 if (clientCtx) {
-                    await this.clientHandshake(clientCtx, this.config.hostname);
+                    await this.asyncDriver(this.performTLSHandshake(clientCtx, this.config.hostname));
                 } else {
                     const caPath = await findSystemCaPath();
                     if (!caPath) throw new Error("No system CA bundle found - cannot verify TLS certificates.");
                     const ctx = new ssl.Context({ mode: "client", verify: true, ca: caPath });
-                    await this.clientHandshake(ctx, this.config.hostname);
+                    await this.asyncDriver(this.performTLSHandshake(ctx, this.config.hostname));
                 }
             }
 
@@ -197,6 +331,240 @@ export class Connection extends TcpSocket implements ConnectionLike {
             throw err;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Write (sync) — direct writeSync on socket
+    // -----------------------------------------------------------------------
+
+    write(data: Uint8Array): void {
+        if (this.sslPipe) {
+            let offset = 0;
+            while (offset < data.length) {
+                const written = this.sslPipe.write(data.subarray(offset));
+                if (written < 0) throw new Error(`SSL_write failed: ${written}`);
+                offset += written;
+            }
+            const encrypted = this.sslPipe.getOutput();
+            if (encrypted) this.socket.writeSync(new Uint8Array(encrypted));
+        } else {
+            this.socket.writeSync(data);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Write (async)
+    // -----------------------------------------------------------------------
+
+    async writeAsync(data: Uint8Array): Promise<void> {
+        if (data.length === 0) return;
+        if (this.sslPipe) {
+            let offset = 0;
+            while (offset < data.length) {
+                const written = this.sslPipe.write(data.subarray(offset));
+                if (written < 0) throw new Error(`SSL_write failed: ${written}`);
+                offset += written;
+            }
+            const encrypted = this.sslPipe.getOutput();
+            if (encrypted) await this.socket.write(new Uint8Array(encrypted));
+        } else {
+            await this.socket.write(data);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Read (sync/async) — dispatch to generator + driver
+    // -----------------------------------------------------------------------
+
+    read(size = 16384, waitForData = false): Uint8Array | null {
+        return this.syncDriver(this.sslPipe
+            ? this.readSSL(size, waitForData)
+            : this.readPlain(size, waitForData));
+    }
+
+    readAsync(size = 16384, waitForData = false): Promise<Uint8Array | null> {
+        return this.asyncDriver(this.sslPipe
+            ? this.readSSL(size, waitForData)
+            : this.readPlain(size, waitForData));
+    }
+
+    // -----------------------------------------------------------------------
+    // Plain read generator — yields IOOp (read)
+    // -----------------------------------------------------------------------
+
+    private *readPlain(size: number, waitForData: boolean): Generator<IOOp, Uint8Array | null> {
+        const buf = new Uint8Array(size);
+        const n = yield ioRead(buf);
+
+        if (n === null) return null;
+        if (n === 0) {
+            if (!waitForData) return null;
+            for (let i = 0; i < 3; i++) {
+                const retryN = yield ioRead(buf);
+                if (retryN === null) return null;
+                if (retryN > 0) return buf.subarray(0, retryN);
+            }
+            return null;
+        }
+        return buf.subarray(0, n);
+    }
+
+    // -----------------------------------------------------------------------
+    // SSL read generator — yields IOOp (read or write)
+    // -----------------------------------------------------------------------
+
+    private *readSSL(size: number, waitForData: boolean): Generator<IOOp, Uint8Array | null> {
+        const maxAttempts = waitForData ? 10 : 1;
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            if (this.pendingCiphertext && this.pendingCiphertext.length > 0) {
+                const consumed = this.feedCiphertext(this.pendingCiphertext);
+                if (consumed > 0) {
+                    this.pendingCiphertext = consumed < this.pendingCiphertext.length
+                        ? this.pendingCiphertext.subarray(consumed)
+                        : null;
+                }
+            }
+
+            const plaintext = this.sslPipe!.read(size);
+            if (plaintext && plaintext.byteLength > 0) {
+                return new Uint8Array(plaintext);
+            }
+
+            const cipherBuf = new Uint8Array(size);
+            const n = yield ioRead(cipherBuf);
+
+            if (n === null) return null;
+
+            if (n === 0) {
+                if (!waitForData) {
+                    const finalPlaintext = this.sslPipe!.read(size);
+                    if (finalPlaintext && finalPlaintext.byteLength > 0) {
+                        return new Uint8Array(finalPlaintext);
+                    }
+                    return null;
+                }
+                continue;
+            }
+
+            const ciphertext = cipherBuf.subarray(0, n);
+            const consumed = this.feedCiphertext(ciphertext);
+
+            if (consumed < ciphertext.length) {
+                const unfed = ciphertext.subarray(consumed);
+                this.pendingCiphertext = this.pendingCiphertext
+                    ? (() => { const m = new Uint8Array(this.pendingCiphertext!.length + unfed.length); m.set(this.pendingCiphertext!); m.set(unfed, this.pendingCiphertext!.length); return m; })()
+                    : unfed;
+            }
+
+            // Flush any SSL output (e.g. TLS renegotiation ClientHello/Finished)
+            const sslOutput = this.sslPipe!.getOutput();
+            if (sslOutput) yield ioWrite(new Uint8Array(sslOutput));
+
+            const newPlaintext = this.sslPipe!.read(size);
+            if (newPlaintext && newPlaintext.byteLength > 0) {
+                return new Uint8Array(newPlaintext);
+            }
+
+            if (!waitForData) return null;
+        }
+        return null;
+    }
+
+    // -----------------------------------------------------------------------
+    // I/O drivers
+    //
+    // syncDriver: uses readSync/writeSync — OS-level blocking I/O.
+    //   On Windows: connectSync commits the socket to sync mode permanently;
+    //   readSync/writeSync work natively.
+    //
+    // asyncDriver: uses native await for truly async execution.
+    // -----------------------------------------------------------------------
+
+    private async asyncDriver<T>(gen: Generator<IOOp, T>): Promise<T> {
+        let next = gen.next();
+        while (!next.done) try {
+            const op = next.value as IOOp;
+            if (op.tag === 'read') {
+                const n = await this.socket.read(op.buf);
+                next = gen.next(n);
+            } else {
+                await this.socket.write(op.data);
+                next = gen.next(undefined);
+            }
+        } catch (e) {
+            next = gen.throw(e);
+        }
+        return next.value;
+    }
+
+    private syncDriver<T>(gen: Generator<IOOp, T>): T {
+        let next = gen.next();
+        while (!next.done) try {
+            const op = next.value as IOOp;
+            if (op.tag === 'read') {
+                const n = this.socket.readSync(op.buf);
+                next = gen.next(n);
+            } else {
+                this.socket.writeSync(op.data);
+                next = gen.next(undefined);
+            }
+        } catch (e) {
+            next = gen.throw(e);
+        }
+        return next.value;
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS handshake generator — yields IOOp for both read AND write
+    // -----------------------------------------------------------------------
+
+    private *performTLSHandshake(ctx: CModuleSSL.Context, servername?: string): Generator<IOOp, void> {
+        this.sslPipe = new ssl.Pipe(ctx, servername ? { servername } : undefined);
+        this.sslPipe.handshake();
+
+        const initialData = this.sslPipe.getOutput();
+        if (initialData) {
+            yield ioWrite(new Uint8Array(initialData));
+        }
+
+        while (!this.sslPipe.handshakeComplete) {
+            const buf = new Uint8Array(16384);
+            const n = yield ioRead(buf);
+
+            if (n === null) throw new Error("TLS handshake failed: connection closed (EOF)");
+            if (n === 0)    throw new Error("TLS handshake failed: no data available (EAGAIN)");
+
+            let toFeed = buf.subarray(0, n);
+            while (toFeed.length > 0) {
+                const consumed = this.feedCiphertext(toFeed);
+                if (consumed === 0) break;
+                if (consumed < 0) throw new Error(`SSL feed failed during handshake: consumed=${consumed}`);
+                toFeed = toFeed.subarray(consumed);
+            }
+
+            this.sslPipe.handshake();
+
+            const responseData = this.sslPipe.getOutput();
+            if (responseData) {
+                yield ioWrite(new Uint8Array(responseData));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SSL helpers
+    // -----------------------------------------------------------------------
+
+    private feedCiphertext(data: Uint8Array): number {
+        if (!this.sslPipe) return 0;
+        const consumed = this.sslPipe.feed(data);
+        if (consumed < 0) throw new Error(`SSL feed error: ${consumed}`);
+        return consumed;
+    }
+
+    // -----------------------------------------------------------------------
+    // State transitions
+    // -----------------------------------------------------------------------
 
     markActive(): void {
         this.stopIdleTimer();
@@ -215,13 +583,22 @@ export class Connection extends TcpSocket implements ConnectionLike {
     close(): void {
         if (this.state === ConnectionState.CLOSED) return;
         this.stopIdleTimer();
-        super.close();
+        try {
+            if (this.sslPipe) this.sslPipe.shutdown();
+        } catch {}
+        this.sslPipe = null;
+        this.pendingCiphertext = null;
+        try { this.socket.close(); } catch {}
         this.state = ConnectionState.CLOSED;
         this.onClose?.();
     }
 
     isAvailable(): boolean { return this.state === ConnectionState.IDLE; }
     isClosed():    boolean { return this.state === ConnectionState.CLOSED; }
+
+    // -----------------------------------------------------------------------
+    // Idle timer
+    // -----------------------------------------------------------------------
 
     private startIdleTimer(): void {
         if (!this.config.keepAlive) return;
@@ -252,13 +629,36 @@ export class ConnectionManager {
         timeout: 30000, keepAlive: true, keepAliveTimeout: 5000, maxSockets: 10
     };
 
-    private getKey(cfg: ConnectionConfig): string {
+    private getKey(cfg: ConnectionConfig, sync = false): string {
         const clientId = cfg.client ? `[client-${cfg.client.getSSLContext() ? 'custom' : 'default'}]` : '';
         const proxyId  = cfg.client?.getProxyUrl() ? `[proxy]` : '';
-        return `${cfg.protocol}//${cfg.hostname}:${cfg.port}${clientId}${proxyId}`;
+        const modeTag  = sync ? '[sync]' : '[async]';
+        return `${cfg.protocol}//${cfg.hostname}:${cfg.port}${clientId}${proxyId}${modeTag}`;
     }
 
-    async acquire(cfg: ConnectionConfig): Promise<Connection> {
+    acquire(cfg: ConnectionConfig): Connection {
+        const fullCfg: ConnectionConfig = { ...this.defaultConfig, ...cfg };
+        const key = this.getKey(fullCfg, true);
+        this.cleanupPool(key);
+
+        let pool = this.pools.get(key) || [];
+        const available = pool.find(c => c.isAvailable());
+        if (available) { available.markActive(); return available; }
+
+        if (pool.length >= (fullCfg.maxSockets || 10)) {
+            this.closeIdleConnections(key);
+        }
+
+        const conn = new Connection(fullCfg);
+        conn.onClose = () => this.removeConnection(fullCfg, conn);
+        pool.push(conn);
+        this.pools.set(key, pool);
+        conn.connect();
+        conn.markActive();
+        return conn;
+    }
+
+    async acquireAsync(cfg: ConnectionConfig): Promise<Connection> {
         const fullCfg: ConnectionConfig = { ...this.defaultConfig, ...cfg };
         const key = this.getKey(fullCfg);
         this.cleanupPool(key);
@@ -275,7 +675,7 @@ export class ConnectionManager {
         conn.onClose = () => this.removeConnection(fullCfg, conn);
         pool.push(conn);
         this.pools.set(key, pool);
-        await conn.connect();
+        await conn.connectAsync();
         conn.markActive();
         return conn;
     }
@@ -283,7 +683,14 @@ export class ConnectionManager {
     release(cfg: ConnectionConfig, conn: Connection): void {
         if (conn.isClosed()) { this.removeConnection(cfg, conn); return; }
         conn.markIdle();
-        this.notifyWaiters(this.getKey(cfg));
+        this.notifyWaiters(this.getKey(cfg, conn.isSync));
+    }
+
+    private closeIdleConnections(key: string): void {
+        const pool = this.pools.get(key) || [];
+        for (const conn of pool) {
+            if (conn.state === ConnectionState.IDLE) conn.close();
+        }
     }
 
     private notifyWaiters(key: string): void {
@@ -348,7 +755,7 @@ export class ConnectionManager {
     }
 
     private removeConnection(cfg: ConnectionConfig, conn: Connection): void {
-        const key = this.getKey(cfg);
+        const key = this.getKey(cfg, conn.isSync);
         const pool = this.pools.get(key);
         if (!pool) return;
         const i = pool.indexOf(conn);
