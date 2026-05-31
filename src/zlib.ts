@@ -50,18 +50,30 @@ export function createDecompressor(encoding: string): ((data: Uint8Array) => Uin
 
 /** Streaming decompressor for incremental decompression. */
 export class StreamingDecompressor {
-    private _decompressFn: ((data: Uint8Array) => Uint8Array) | null;
+    private _stream: ReturnType<typeof zlib.createGunzip> | null;
     private _encoding: string;
+    private _deflateRawFallback = false;
     constructor(encoding: string) {
         this._encoding = encoding.toLowerCase().trim();
-        this._decompressFn = createDecompressor(encoding);
+        if (this._encoding === 'gzip') this._stream = zlib.createGunzip();
+        else if (this._encoding === 'deflate') this._stream = zlib.createInflate();
+        else this._stream = null;
     }
     decompress(chunk: Uint8Array): Uint8Array {
-        if (!this._decompressFn || chunk.length === 0) return chunk;
-        return this._decompressFn(chunk);
+        if (!this._stream || chunk.length === 0) return chunk;
+        try {
+            return new Uint8Array(this._stream.inflate(chunk));
+        } catch (err) {
+            if (this._encoding === 'deflate' && !this._deflateRawFallback) {
+                this._deflateRawFallback = true;
+                this._stream = zlib.createInflateRaw();
+                return new Uint8Array(this._stream.inflate(chunk));
+            }
+            throw err;
+        }
     }
     get encoding(): string { return this._encoding; }
-    get isActive(): boolean { return this._decompressFn !== null; }
+    get isActive(): boolean { return this._stream !== null; }
 }
 
 /** Create a one-shot compressor. */
@@ -70,4 +82,24 @@ export function createCompressor(encoding: string, level = zlib.DEFAULT_COMPRESS
     if (enc === 'gzip') return (data) => new Uint8Array(zlib.gzip(data, level));
     if (enc === 'deflate') return (data) => new Uint8Array(zlib.deflate(data, level));
     return null;
+}
+
+/** Streaming compressor — produces a single continuous gzip/deflate stream across multiple chunks. */
+export class StreamingCompressor {
+    private _stream: ReturnType<typeof zlib.createGzip> | null;
+    constructor(encoding: string, level = zlib.DEFAULT_COMPRESSION) {
+        const enc = encoding.toLowerCase().trim();
+        if (enc === 'gzip') this._stream = zlib.createGzip(level);
+        else if (enc === 'deflate') this._stream = zlib.createDeflate(level);
+        else this._stream = null;
+    }
+    compress(chunk: Uint8Array): Uint8Array {
+        if (!this._stream || chunk.length === 0) return chunk;
+        return new Uint8Array(this._stream.deflate(chunk));
+    }
+    finish(): Uint8Array {
+        if (!this._stream) return new Uint8Array(0);
+        return new Uint8Array(this._stream.finish());
+    }
+    get isActive(): boolean { return this._stream !== null; }
 }

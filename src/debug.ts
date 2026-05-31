@@ -1,10 +1,49 @@
 /**
- * Hexadecimal dump utility for debugging network data.
+ * Debug logging and hexadecimal dump utilities for @cnojs/http.
  *
- * Merged from: cts/src/http/debug.ts
+ * Uses the same DEBUG env var as cts. Add 'http' (or sub-categories) to enable:
+ *   DEBUG=*           — everything (including http)
+ *   DEBUG=http        — all http sub-categories
+ *   DEBUG=http.conn   — connection / DNS / TLS only
+ *   DEBUG=http.fetch  — fetch lifecycle only
+ *   DEBUG=http.h1     — HTTP/1.x parser events only
  */
 
 const console = import.meta.use('console');
+const os = import.meta.use('os');
+
+// ---------------------------------------------------------------------------
+// Debug logger — reads the shared DEBUG env var, supports !negation
+// ---------------------------------------------------------------------------
+
+let _init = false;
+const _enabled  = new Set<string>();
+const _disabled = new Set<string>();
+
+function _lazyInit(): void {
+    if (_init) return;
+    _init = true;
+    let raw = '';
+    try { raw = os.getenv('DEBUG') ?? ''; } catch {}
+    for (const tok of raw.split(',').map((s: string) => s.trim()).filter(Boolean)) {
+        if (tok.startsWith('!')) _disabled.add(tok.slice(1));
+        else _enabled.add(tok);
+    }
+}
+
+export function isDebugEnabled(category: string): boolean {
+    _lazyInit();
+    if (_disabled.has(category) || _disabled.has('http')) return false;
+    // category is e.g. 'http.conn' — also check parent 'http' and wildcard '*'
+    const parent = category.includes('.') ? category.slice(0, category.indexOf('.')) : null;
+    return _enabled.has('*') || _enabled.has(category) || (parent !== null && _enabled.has(parent));
+}
+
+export function dbg(category: string, msg: string | (() => string), ...rest: any[]): void {
+    if (!isDebugEnabled(category)) return;
+    const text = typeof msg === 'function' ? msg() : msg;
+    console.log(`\x1b[2m[${category}]\x1b[0m ${text}`, ...rest);
+}
 
 /**
  * Hexadecimal debugging output function.

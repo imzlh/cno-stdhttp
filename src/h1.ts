@@ -24,7 +24,7 @@ import {
     type ProtocolConnectionEvents,
     HttpVersion, ALPN,
 } from "./protocol";
-import { StreamingDecompressor, parseAcceptEncoding, pickEncoding, shouldCompress, createCompressor } from "./zlib";
+import { StreamingDecompressor, StreamingCompressor, parseAcceptEncoding, pickEncoding, shouldCompress } from "./zlib";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -57,7 +57,6 @@ export class HttpRequestBuilder {
 
     static DEFAULT_HEADERS: Array<[string, string]> = [
         ['accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'],
-        ['accept-encoding', 'gzip, deflate'],
         ['accept-language', 'zh-CN,zh;q=0.9'],
         ['user-agent', 'cnojs/http'],
     ];
@@ -189,12 +188,12 @@ class H1Stream implements ProtocolStream {
     async writeHead(data: RawRequest | RawResponse): Promise<void> {
         if (this.isServer) {
             const res = data as RawResponse;
-            (this.conn as H1ServerConnection).writeHead(res.status, res.statusText, res.headers);
+            await (this.conn as H1ServerConnection).writeHead(res.status, res.statusText, res.headers);
         } else {
             const req = data as RawRequest;
             const builder = new HttpRequestBuilder({ method: req.method, path: req.url, body: req.body as Uint8Array | null });
             for (const [k, v] of req.headers) builder.setHeader(k, v);
-            (this.conn as H1ClientConnection).writeRequest(builder.build());
+            await (this.conn as H1ClientConnection).writeRequest(builder.build());
         }
     }
     async writeData(data: Uint8Array): Promise<void> { if (this.isServer) (this.conn as H1ServerConnection).writeData(data); }
@@ -222,7 +221,7 @@ export class H1ServerConnection implements ProtocolConnection {
     private bodyEnd: (() => void) | null = null;
     private headersSent = false; private responseEnded = false; private chunkedEncoding = false;
     private compressEncoding: 'gzip' | 'deflate' | null = null;
-    private compressor: ((data: Uint8Array) => Uint8Array) | null = null;
+    private compressor: StreamingCompressor | null = null;
     private requestCount = 0; private keepAlive = true; private requestHttpVersion = '1.1';
     private _closed = false;
     private events: ProtocolConnectionEvents = { onstream: null, onError: null, onClose: null, onGoaway: null, onSettings: null };
@@ -255,15 +254,49 @@ export class H1ServerConnection implements ProtocolConnection {
     async handleRequest(handler: (req: RawRequest, res: RawResponse) => void | Promise<void>): Promise<boolean> {
         this.method = ''; this.url = ''; this.reqHeaders = []; this.headerField = ''; this.headersOk = false;
         this.expectBody = false; this.contentLength = 0; this.chunked = false; this.bodyRead = 0;
-        this.bodyCtrl = null; this.bodyEnd = null; this.headersSent = false; this.responseEnded = false;
+        this.headersSent = false; this.responseEnded = false;
         this.chunkedEncoding = false; this.compressEncoding = null; this.compressor = null;
 
-        while (!this.headersOk) { const data = await this.socket.read(); if (data === null) return false; if (data.length === 0) continue; const r = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset)); if (r.errno !== 0) { if (r.name === 'HPE_PAUSED_UPGRADE') { this.keepAlive = false; break; } throw new Error(`Parse error: ${r.reason}`); } }
+        // Set up body collection before any execute() — headers and body may arrive
+        // in the same TCP segment (coalescing), so we can't set this up after headers.
+        const bodyChunks: Uint8Array[] = [];
+        let messageDone = false;
+        this.bodyCtrl = (chunk) => bodyChunks.push(chunk);
+        this.bodyEnd  = () => { messageDone = true; this.bodyCtrl = null; this.bodyEnd = null; };
 
-        const req: RawRequest = { method: this.method, url: this.url, httpVersion: `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`, headers: this.reqHeaders, body: null };
-        let resolveRes: (res: RawResponse) => void;
+        // Single loop: reads until we have headers (for GET) or full message (for POST).
+        while (true) {
+            // After headers: if no body expected the message is logically done.
+            if (this.headersOk && !this.expectBody) break;
+            // After headers + body via coalesced packet.
+            if (messageDone) break;
+
+            const data = await this.socket.read();
+            if (data === null) {
+                if (!this.headersOk) return false;
+                break; // EOF mid-body — handler will see partial body
+            }
+            if (data.length === 0) continue;
+
+            const r = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
+            if (r.errno !== 0) {
+                if (r.name === 'HPE_PAUSED_UPGRADE') { this.keepAlive = false; break; }
+                throw new Error(`Parse error: ${r.reason}`);
+            }
+        }
+
+        this.bodyCtrl = null; this.bodyEnd = null;
+
+        let body: Uint8Array | null = null;
+        if (bodyChunks.length > 0) {
+            const total = bodyChunks.reduce((s, c) => s + c.length, 0);
+            body = new Uint8Array(total); let off = 0;
+            for (const c of bodyChunks) { body.set(c, off); off += c.length; }
+        }
+
+        const req: RawRequest = { method: this.method, url: this.url, httpVersion: `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`, headers: this.reqHeaders, body };
         const res: RawResponse = { status: 200, statusText: 'OK', headers: [], body: null };
-        await handler(req, res); resolveRes!(res);
+        await handler(req, res);
         this.parser.reset(http.REQUEST); this.requestCount++;
         return this.keepAlive;
     }
@@ -274,7 +307,7 @@ export class H1ServerConnection implements ProtocolConnection {
         if (te?.toLowerCase().includes('chunked')) this.chunkedEncoding = true;
         if (this.compressEncoding && !headers.find(([n]) => n === 'content-encoding') && !this.chunkedEncoding) {
             const ct = headers.find(([n]) => n === 'content-type')?.[1];
-            if (!ct || shouldCompress(ct)) { this.compressor = createCompressor(this.compressEncoding); headers.push(['content-encoding', this.compressEncoding]); headers = headers.filter(([n]) => n !== 'content-length'); this.chunkedEncoding = true; }
+            if (!ct || shouldCompress(ct)) { this.compressor = new StreamingCompressor(this.compressEncoding); headers.push(['content-encoding', this.compressEncoding]); headers.push(['transfer-encoding', 'chunked']); headers = headers.filter(([n]) => n !== 'content-length'); this.chunkedEncoding = true; }
         }
         let raw = `HTTP/${this.requestHttpVersion} ${status} ${statusText}\r\n`;
         if (!headers.find(([n]) => n === 'connection')) raw += this.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
@@ -288,7 +321,7 @@ export class H1ServerConnection implements ProtocolConnection {
         if (this.responseEnded) throw new Error("Response already ended");
         if (!this.headersSent) { if (this.requestHttpVersion === "1.0") { this.keepAlive = false; await this.writeHead(200, "OK", []); } else { this.chunkedEncoding = true; await this.writeHead(200, "OK", [['transfer-encoding', 'chunked']]); } }
         let data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
-        if (this.compressor) data = this.compressor(data);
+        if (this.compressor) data = this.compressor.compress(data);
         if (this.chunkedEncoding) { await this.socket.write(engine.encodeString(data.length.toString(16) + "\r\n")); await this.socket.write(data); await this.socket.write(engine.encodeString("\r\n")); }
         else await this.socket.write(data);
     }
@@ -297,6 +330,14 @@ export class H1ServerConnection implements ProtocolConnection {
         if (this.responseEnded) return;
         if (chunk !== undefined) await this.writeData(chunk);
         else if (!this.headersSent) await this.writeHead(200, "OK", [['content-length', '0']]);
+        if (this.compressor) {
+            const tail = this.compressor.finish();
+            if (tail.length > 0 && this.chunkedEncoding) {
+                await this.socket.write(engine.encodeString(tail.length.toString(16) + "\r\n"));
+                await this.socket.write(tail);
+                await this.socket.write(engine.encodeString("\r\n"));
+            }
+        }
         if (this.chunkedEncoding) { await this.socket.write(engine.encodeString("0\r\n\r\n")); this.chunkedEncoding = false; }
         this.compressor = null; this.compressEncoding = null; this.responseEnded = true;
     }
@@ -342,7 +383,15 @@ class H1ClientConnection implements ProtocolConnection {
     goaway(): void { this.close(); }
     close(): void { this.socket.close(); }
     destroy(): void { this.socket.close(); }
-    async readResponse(): Promise<RawResponse> { return { status: 0, statusText: '', headers: [], body: null }; }
+    async readResponse(): Promise<RawResponse> {
+        // Drive the parser until the response is complete.
+        if (!this.parser) this.parser = new HttpResponseParser();
+        let status = 0; const headers: Array<[string, string]> = []; const chunks: Uint8Array[] = [];
+        this.parser.onHeadersComplete = (code, hdrs) => { status = code; headers.push(...hdrs); };
+        this.parser.onData = (chunk) => chunks.push(chunk);
+        while (!this.parser.isCompleted) { const d = await this.socket.read(); if (!d) break; this.parser.feed(d); }
+        return { status, statusText: strstatus(status), headers, body: mergeChunks(chunks) };
+    }
     async writeRequest(data: Uint8Array): Promise<void> { await this.socket.write(data); }
 }
 

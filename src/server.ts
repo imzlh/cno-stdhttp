@@ -142,7 +142,8 @@ export class Server {
             if (this.draining) { client.close(); return; }
             client.setNoDelay(true);
             client.setKeepAlive(true, 1000);
-            this.handleConnection(client as TcpSocket).catch((e: Error) => {
+            const tcpSocket = new TcpSocket(client);
+            this.handleConnection(tcpSocket).catch((e: Error) => {
                 if (!TcpSocket.isDisconnectError(e)) console.error("Connection error:", e);
             });
         };

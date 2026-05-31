@@ -21,6 +21,7 @@ const fs = import.meta.use("fs");
 const streams = import.meta.use("streams");
 
 import { dnsCache } from "./dns-cache";
+import { dbg } from "./debug";
 
 function assert(condition: unknown, message?: string): asserts condition {
     if (!condition) throw new Error(message ?? "Assertion failed");
@@ -248,6 +249,7 @@ export class Connection implements ConnectionLike {
         try {
             this.isSync = true;
             const isSecure = this.config.protocol === "https:";
+            dbg('http.conn', () => `connect(sync) ${this.config.protocol}//${this.config.hostname}:${this.config.port}`);
 
             if (this.config.client) {
                 this.socket = engine.waitPromise(
@@ -258,16 +260,19 @@ export class Connection implements ConnectionLike {
                 if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.config.hostname}`);
                 const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
                 assert(addr, `No IP address found for ${this.config.hostname}`);
+                dbg('http.conn', () => `DNS resolved ${this.config.hostname} → ${addr.ip}`);
                 this.socket.connectSync({ ip: addr.ip, port: this.config.port });
             }
 
             if (isSecure) {
                 const clientCtx = this.config.client?.getSSLContext();
                 if (clientCtx) {
+                    dbg('http.conn', () => `TLS handshake (custom ctx) for ${this.config.hostname}`);
                     this.syncDriver(this.performTLSHandshake(clientCtx, this.config.hostname));
                 } else {
                     const caPath = findSystemCaPathSync();
                     if (!caPath) throw new Error("No system CA bundle found - cannot verify TLS certificates.");
+                    dbg('http.conn', () => `TLS handshake for ${this.config.hostname} (ca: ${caPath})`);
                     const ctx = new ssl.Context({ mode: "client", verify: true, ca: caPath });
                     this.syncDriver(this.performTLSHandshake(ctx, this.config.hostname));
                 }
@@ -275,14 +280,17 @@ export class Connection implements ConnectionLike {
 
             this.socket.onclose = () => {
                 if (this.state === ConnectionState.CLOSED) return;
+                dbg('http.conn', () => `socket closed: ${this.config.hostname}:${this.config.port}`);
                 this.stopIdleTimer();
                 this.state = ConnectionState.CLOSED;
                 this.onClose?.();
             };
 
+            dbg('http.conn', () => `connected(sync): ${this.config.hostname}:${this.config.port}`);
             this.state = ConnectionState.IDLE;
             this.startIdleTimer();
         } catch (err) {
+            dbg('http.conn', () => `connect(sync) FAILED ${this.config.hostname}:${this.config.port}: ${err}`);
             this.state = ConnectionState.CLOSED;
             throw err;
         }
@@ -295,6 +303,7 @@ export class Connection implements ConnectionLike {
     async connectAsync(): Promise<void> {
         try {
             const isSecure = this.config.protocol === "https:";
+            dbg('http.conn', () => `connect(async) ${this.config.protocol}//${this.config.hostname}:${this.config.port}`);
 
             if (this.config.client) {
                 this.socket = await this.config.client.connect(
@@ -305,16 +314,19 @@ export class Connection implements ConnectionLike {
                 if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.config.hostname}`);
                 const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
                 assert(addr, `No IP address found for ${this.config.hostname}`);
+                dbg('http.conn', () => `DNS resolved ${this.config.hostname} → ${addr.ip}`);
                 await this.socket.connect({ ip: addr.ip, port: this.config.port });
             }
 
             if (isSecure) {
                 const clientCtx = this.config.client?.getSSLContext();
                 if (clientCtx) {
+                    dbg('http.conn', () => `TLS handshake (custom ctx) for ${this.config.hostname}`);
                     await this.asyncDriver(this.performTLSHandshake(clientCtx, this.config.hostname));
                 } else {
                     const caPath = await findSystemCaPath();
                     if (!caPath) throw new Error("No system CA bundle found - cannot verify TLS certificates.");
+                    dbg('http.conn', () => `TLS handshake for ${this.config.hostname} (ca: ${caPath})`);
                     const ctx = new ssl.Context({ mode: "client", verify: true, ca: caPath });
                     await this.asyncDriver(this.performTLSHandshake(ctx, this.config.hostname));
                 }
@@ -322,11 +334,17 @@ export class Connection implements ConnectionLike {
 
             this.socket.onclose = () => {
                 if (this.state === ConnectionState.CLOSED) return;
+                dbg('http.conn', () => `socket closed: ${this.config.hostname}:${this.config.port}`);
                 this.stopIdleTimer();
                 this.state = ConnectionState.CLOSED;
                 this.onClose?.();
             };
+
+            dbg('http.conn', () => `connected(async): ${this.config.hostname}:${this.config.port}`);
+            this.state = ConnectionState.IDLE;
+            this.startIdleTimer();
         } catch (err) {
+            dbg('http.conn', () => `connect(async) FAILED ${this.config.hostname}:${this.config.port}: ${err}`);
             this.state = ConnectionState.CLOSED;
             throw err;
         }
@@ -345,9 +363,9 @@ export class Connection implements ConnectionLike {
                 offset += written;
             }
             const encrypted = this.sslPipe.getOutput();
-            if (encrypted) this.socket.writeSync(new Uint8Array(encrypted));
+            if (encrypted) engine.waitPromise(this.socket.write(new Uint8Array(encrypted)));
         } else {
-            this.socket.writeSync(data);
+            engine.waitPromise(this.socket.write(data));
         }
     }
 
@@ -413,42 +431,65 @@ export class Connection implements ConnectionLike {
     // -----------------------------------------------------------------------
 
     private *readSSL(size: number, waitForData: boolean): Generator<IOOp, Uint8Array | null> {
-        const maxAttempts = waitForData ? 10 : 1;
-
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            if (this.pendingCiphertext && this.pendingCiphertext.length > 0) {
-                const consumed = this.feedCiphertext(this.pendingCiphertext);
-                if (consumed > 0) {
-                    this.pendingCiphertext = consumed < this.pendingCiphertext.length
-                        ? this.pendingCiphertext.subarray(consumed)
-                        : null;
-                }
+        // Drain any buffered pending ciphertext first
+        if (this.pendingCiphertext && this.pendingCiphertext.length > 0) {
+            const consumed = this.feedCiphertext(this.pendingCiphertext);
+            if (consumed > 0) {
+                this.pendingCiphertext = consumed < this.pendingCiphertext.length
+                    ? this.pendingCiphertext.subarray(consumed)
+                    : null;
             }
+            // Drive handshake state machine and flush any output (e.g. renegotiation)
+            this.sslPipe!.handshake();
+            const pending = this.sslPipe!.getOutput();
+            if (pending) yield ioWrite(new Uint8Array(pending));
+        }
 
-            const plaintext = this.sslPipe!.read(size);
-            if (plaintext && plaintext.byteLength > 0) {
-                return new Uint8Array(plaintext);
-            }
+        // Return buffered plaintext if available
+        const buffered = this.sslPipe!.read(size);
+        if (buffered && buffered.byteLength > 0) return new Uint8Array(buffered);
 
+        // Read loop: keep reading until we get plaintext or true EOF.
+        // We loop on "n > 0 but no plaintext" because that means SSL is processing
+        // a mid-stream handshake (TLS renegotiation) and needs more data.
+        while (true) {
             const cipherBuf = new Uint8Array(size);
             const n = yield ioRead(cipherBuf);
 
-            if (n === null) return null;
-
+            if (n === null) return null; // sync EOF
             if (n === 0) {
-                if (!waitForData) {
-                    const finalPlaintext = this.sslPipe!.read(size);
-                    if (finalPlaintext && finalPlaintext.byteLength > 0) {
-                        return new Uint8Array(finalPlaintext);
+                if (!waitForData) return null;
+                // Windows/TLS may transiently yield 0 while the socket is still
+                // alive. Retry a few times before treating it as EOF.
+                for (let i = 0; i < 3; i++) {
+                    const retryBuf = new Uint8Array(size);
+                    const retryN = yield ioRead(retryBuf);
+                    if (retryN === null) return null;
+                    if (retryN === 0) continue;
+                    const retryCiphertext = retryBuf.subarray(0, retryN);
+                    const retryConsumed = this.feedCiphertext(retryCiphertext);
+                    if (retryConsumed < retryCiphertext.length) {
+                        const unfed = retryCiphertext.subarray(retryConsumed);
+                        this.pendingCiphertext = this.pendingCiphertext
+                            ? (() => {
+                                const merged = new Uint8Array(this.pendingCiphertext!.length + unfed.length);
+                                merged.set(this.pendingCiphertext!);
+                                merged.set(unfed, this.pendingCiphertext!.length);
+                                return merged;
+                            })()
+                            : unfed;
                     }
-                    return null;
+                    this.sslPipe!.handshake();
+                    const retryOutput = this.sslPipe!.getOutput();
+                    if (retryOutput) yield ioWrite(new Uint8Array(retryOutput));
+                    const retryPlaintext = this.sslPipe!.read(size);
+                    if (retryPlaintext && retryPlaintext.byteLength > 0) return new Uint8Array(retryPlaintext);
                 }
-                continue;
+                return null;
             }
 
             const ciphertext = cipherBuf.subarray(0, n);
             const consumed = this.feedCiphertext(ciphertext);
-
             if (consumed < ciphertext.length) {
                 const unfed = ciphertext.subarray(consumed);
                 this.pendingCiphertext = this.pendingCiphertext
@@ -456,18 +497,15 @@ export class Connection implements ConnectionLike {
                     : unfed;
             }
 
-            // Flush any SSL output (e.g. TLS renegotiation ClientHello/Finished)
+            // Drive SSL state machine (handles renegotiation), then flush output
+            this.sslPipe!.handshake();
             const sslOutput = this.sslPipe!.getOutput();
             if (sslOutput) yield ioWrite(new Uint8Array(sslOutput));
 
-            const newPlaintext = this.sslPipe!.read(size);
-            if (newPlaintext && newPlaintext.byteLength > 0) {
-                return new Uint8Array(newPlaintext);
-            }
-
-            if (!waitForData) return null;
+            const plaintext = this.sslPipe!.read(size);
+            if (plaintext && plaintext.byteLength > 0) return new Uint8Array(plaintext);
+            // No plaintext yet (renegotiation in progress or partial TLS record) — loop
         }
-        return null;
     }
 
     // -----------------------------------------------------------------------
@@ -502,10 +540,10 @@ export class Connection implements ConnectionLike {
         while (!next.done) try {
             const op = next.value as IOOp;
             if (op.tag === 'read') {
-                const n = this.socket.readSync(op.buf);
+                const n = engine.waitPromise(this.socket.read(op.buf));
                 next = gen.next(n);
             } else {
-                this.socket.writeSync(op.data);
+                engine.waitPromise(this.socket.write(op.data));
                 next = gen.next(undefined);
             }
         } catch (e) {
@@ -643,12 +681,16 @@ export class ConnectionManager {
 
         let pool = this.pools.get(key) || [];
         const available = pool.find(c => c.isAvailable());
-        if (available) { available.markActive(); return available; }
+        if (available) {
+            dbg('http.conn', () => `pool hit (sync): ${key} (pool size=${pool.length})`);
+            available.markActive(); return available;
+        }
 
         if (pool.length >= (fullCfg.maxSockets || 10)) {
             this.closeIdleConnections(key);
         }
 
+        dbg('http.conn', () => `pool miss (sync): ${key} — creating new connection`);
         const conn = new Connection(fullCfg);
         conn.onClose = () => this.removeConnection(fullCfg, conn);
         pool.push(conn);
@@ -665,12 +707,17 @@ export class ConnectionManager {
 
         let pool = this.pools.get(key) || [];
         const available = pool.find(c => c.isAvailable());
-        if (available) { available.markActive(); return available; }
+        if (available) {
+            dbg('http.conn', () => `pool hit (async): ${key} (pool size=${pool.length})`);
+            available.markActive(); return available;
+        }
 
         if (pool.length >= (fullCfg.maxSockets || 10)) {
+            dbg('http.conn', () => `pool full: ${key} — waiting for free connection`);
             return this.waitForConnection(key, fullCfg);
         }
 
+        dbg('http.conn', () => `pool miss (async): ${key} — creating new connection`);
         const conn = new Connection(fullCfg);
         conn.onClose = () => this.removeConnection(fullCfg, conn);
         pool.push(conn);
@@ -682,6 +729,7 @@ export class ConnectionManager {
 
     release(cfg: ConnectionConfig, conn: Connection): void {
         if (conn.isClosed()) { this.removeConnection(cfg, conn); return; }
+        dbg('http.conn', () => `release: ${this.getKey(cfg, conn.isSync)} (requests=${conn.requests})`);
         conn.markIdle();
         this.notifyWaiters(this.getKey(cfg, conn.isSync));
     }

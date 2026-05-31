@@ -33,7 +33,7 @@ import {
     type ProtocolConnectionEvents, type AlpnProtocol,
     HttpVersion, ALPN, type RawHeaders,
 } from "./protocol";
-import { StreamingDecompressor, parseAcceptEncoding, pickEncoding, shouldCompress, createCompressor } from "./zlib";
+import { StreamingDecompressor, parseAcceptEncoding, pickEncoding, shouldCompress } from "./zlib";
 
 type NativeUint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type NgHttp2Session = InstanceType<typeof nghttp2Mod.Session>;

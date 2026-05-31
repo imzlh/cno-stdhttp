@@ -88,15 +88,20 @@ export class TcpSocket {
             if (plain) return plain;
         }
 
-        const buf = new Uint8Array(size);
+        const buf = new Uint8Array(READ_SIZE);
         while (true) {
             const n = await this.socket.read(buf);
-            if (n === 0) return null;
+            if (n === 0) return null; // EOF
             const cipher = buf.subarray(0, n);
             const consumed = this.feedCipher(cipher);
             if (consumed < cipher.length) this.pending = cipher.subarray(consumed);
+            // Drive SSL state machine (handles renegotiation), then flush any output
+            this.sslPipe!.handshake();
+            const out = this.sslPipe!.getOutput();
+            if (out) await this.socket.write(new Uint8Array(out));
             const plain = this.sslRead(size);
             if (plain) return plain;
+            // No plaintext yet — renegotiation or partial TLS record, loop
         }
     }
 
@@ -204,6 +209,7 @@ export class TcpSocket {
     static isDisconnectError(err: unknown): boolean {
         if (!(err instanceof Error)) return false;
         const code = (err as any).code;
-        return code === error.errno.ECONNRESET || code === error.errno.EPIPE || code === error.errno.EBADF;
+        return code === error.errno.ECONNRESET || code === error.errno.EPIPE ||
+               code === error.errno.EBADF || code === error.errno.ECANCELED;
     }
 }

@@ -6,6 +6,7 @@
 import { connectionManager } from "./connection";
 import { HttpRequestBuilder, HttpResponseParser } from "./h1";
 import { HttpVersion } from "./protocol";
+import { dbg } from "./debug";
 
 const engine = import.meta.use("engine");
 
@@ -17,11 +18,11 @@ export interface FetchOptions {
     body?: Uint8Array | null;
 }
 
-function parseUrl(url: string): { protocol: string; hostname: string; port: number; path: string } {
+function parseUrl(url: string): { protocol: 'http:' | 'https:'; hostname: string; port: number; path: string } {
     const match = url.match(/^(https?):\/\/([^/:]+)(?::(\d+))?(\/.*)?$/);
     if (!match) throw new Error(`Invalid URL: ${url}`);
     return {
-        protocol: match[1]!,
+        protocol: `${match[1]}:` as 'http:' | 'https:',
         hostname: match[2]!,
         port: match[3] ? parseInt(match[3]) : (match[1] === 'https' ? 443 : 80),
         path: match[4] ?? '/',
@@ -49,12 +50,19 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     return result;
 }
 
+function shouldKeepAlive(parser: HttpResponseParser): boolean {
+    if (parser.isHttp10) {
+        return parser.getHeaders().some(([n, v]) => n === 'connection' && v.toLowerCase() === 'keep-alive');
+    }
+    return !parser.getHeaders().some(([n, v]) => n === 'connection' && v.toLowerCase() === 'close');
+}
+
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 const connConfig = (parsed: ReturnType<typeof parseUrl>) => ({
     hostname: parsed.hostname,
     port: parsed.port,
-    protocol: parsed.protocol as 'http:' | 'https:',
+    protocol: parsed.protocol,
 });
 
 /* ------------------------------------------------------------------ */
@@ -66,6 +74,7 @@ export function fetchBytes(url: string, onProgress?: ProgressCallback, httpVersi
     const httpVersion: HttpVersion = typeof httpVersionOrOpts === 'string' ? httpVersionOrOpts : HttpVersion.HTTP11;
     const parsed = parseUrl(url);
     const cfg = connConfig(parsed);
+    dbg('http.fetch', () => `→ ${opts?.method ?? 'GET'} ${url}`);
     const conn = connectionManager.acquire(cfg);
 
     const headers = buildHeaders(parsed.hostname, httpVersion, opts);
@@ -73,8 +82,8 @@ export function fetchBytes(url: string, onProgress?: ProgressCallback, httpVersi
         method: opts?.method ?? 'GET', path: parsed.path, host: parsed.hostname,
         httpVersion, headers, body: opts?.body ?? null,
     });
-
-    conn.write(builder.build());
+    const requestBytes = builder.build();
+    conn.write(requestBytes);
 
     const parser = new HttpResponseParser();
     const chunks: Uint8Array[] = [];
@@ -83,34 +92,51 @@ export function fetchBytes(url: string, onProgress?: ProgressCallback, httpVersi
     let parseError: Error | null = null;
 
     parser.onHeadersComplete = (status, hdrs) => {
-        void status;
         const cl = hdrs.find(([n]) => n === 'content-length');
         if (cl) contentLength = parseInt(cl[1]!, 10);
+        dbg('http.fetch', () => `← ${status} (content-length: ${contentLength || 'unknown'}) ${url}`);
     };
     parser.onData = (chunk) => { chunks.push(chunk); loaded += chunk.length; onProgress?.(loaded, contentLength); };
     parser.onError = (e) => { parseError = e; };
 
     while (!parser.isCompleted && !parseError) {
-        const d = conn.read(128 * 1024);
+        const d = conn.read(128 * 1024, true);
         if (!d) break;
         parser.feed(d);
     }
 
-    if (parseError) { conn.close(); throw parseError; }
+    if (parseError) {
+        dbg('http.fetch', () => `parse error: ${parseError} ${url}`);
+        conn.close(); throw parseError;
+    }
+    if (!parser.isCompleted) {
+        conn.close();
+        throw new Error(`Response not completed: ${url}`);
+    }
 
     const status = parser.getStatusCode();
+    const reusable = shouldKeepAlive(parser);
     if (status >= 300 && status < 400) {
         const location = parser.getHeaders().find(([n]) => n === 'location')?.[1];
         if (location) {
-            connectionManager.release(cfg, conn);
-            const nextUrl = location.startsWith('/') ? `${parsed.protocol}://${parsed.hostname}:${parsed.port}${location}` : location;
+            if (reusable) connectionManager.release(cfg, conn);
+            else conn.close();
+            const nextUrl = location.startsWith('/') ? `${parsed.protocol}//${parsed.hostname}:${parsed.port}${location}` : location;
+            dbg('http.fetch', () => `redirect ${status} → ${nextUrl}`);
             return fetchBytes(nextUrl, onProgress, httpVersionOrOpts);
         }
     }
 
-    connectionManager.release(cfg, conn);
-    if (status < 200 || status >= 300) throw new Error(`HTTP ${status} ${url}`);
+    if (reusable) connectionManager.release(cfg, conn);
+    else conn.close();
+    if (status < 200 || status >= 300) {
+        const body = mergeChunks(chunks);
+        dbg('http.fetch', () => `error headers: ${JSON.stringify(parser.getHeaders())}`);
+        dbg('http.fetch', () => `error response: ${status} ${url}`);
+        throw new Error(`HTTP ${status} ${url}`);
+    }
 
+    dbg('http.fetch', () => `done: ${loaded} bytes from ${url}`);
     return mergeChunks(chunks);
 }
 
@@ -126,8 +152,8 @@ export function fetchSync(url: string, onProgress?: ProgressCallback, httpVersio
         method: opts?.method ?? 'GET', path: parsed.path, host: parsed.hostname,
         httpVersion, headers, body: opts?.body ?? null,
     });
-
-    conn.write(builder.build());
+    const requestBytes = builder.build();
+    conn.write(requestBytes);
 
     const parser = new HttpResponseParser();
     const chunks: Uint8Array[] = [];
@@ -144,28 +170,40 @@ export function fetchSync(url: string, onProgress?: ProgressCallback, httpVersio
     parser.onError = (e) => { parseError = e; };
 
     while (!parser.isCompleted && !parseError) {
-        const d = conn.read(128 * 1024);
+        const d = conn.read(128 * 1024, true);
         if (!d) break;
         parser.feed(d);
     }
 
     if (parseError) { conn.close(); throw parseError; }
+    if (!parser.isCompleted) {
+        conn.close();
+        throw new Error(`Response not completed: ${url}`);
+    }
 
     const status = parser.getStatusCode();
     const respHeaders = parser.getHeaders();
+    const reusable = shouldKeepAlive(parser);
 
     if (status >= 300 && status < 400) {
         const location = respHeaders.find(([n]) => n === 'location')?.[1];
         if (location) {
-            connectionManager.release(cfg, conn);
-            const nextUrl = location.startsWith('/') ? `${parsed.protocol}://${parsed.hostname}:${parsed.port}${location}` : location;
+            if (reusable) connectionManager.release(cfg, conn);
+            else conn.close();
+            const nextUrl = location.startsWith('/') ? `${parsed.protocol}//${parsed.hostname}:${parsed.port}${location}` : location;
             return fetchSync(nextUrl, onProgress, httpVersionOrOpts);
         }
     }
 
-    connectionManager.release(cfg, conn);
+    if (reusable) connectionManager.release(cfg, conn);
+    else conn.close();
 
-    return { status, headers: respHeaders, body: mergeChunks(chunks) };
+    const body = mergeChunks(chunks);
+    if (status < 200 || status >= 300) {
+        dbg('http.fetch', () => `error headers: ${JSON.stringify(respHeaders)}`);
+    }
+
+    return { status, headers: respHeaders, body };
 }
 
 export function fetchText(url: string, httpVersion?: HttpVersion): string {
@@ -182,6 +220,7 @@ export async function fetchBytesAsync(url: string, onProgress?: ProgressCallback
     const httpVersion: HttpVersion = typeof httpVersionOrOpts === 'string' ? httpVersionOrOpts : HttpVersion.HTTP11;
     const parsed = parseUrl(url);
     const cfg = connConfig(parsed);
+    dbg('http.fetch', () => `→ ${opts?.method ?? 'GET'} ${url} (async)`);
     const conn = await connectionManager.acquireAsync(cfg);
 
     const headers = buildHeaders(parsed.hostname, httpVersion, opts);
@@ -189,8 +228,8 @@ export async function fetchBytesAsync(url: string, onProgress?: ProgressCallback
         method: opts?.method ?? 'GET', path: parsed.path, host: parsed.hostname,
         httpVersion, headers, body: opts?.body ?? null,
     });
-
-    await conn.writeAsync(builder.build());
+    const requestBytes = builder.build();
+    await conn.writeAsync(requestBytes);
 
     const parser = new HttpResponseParser();
     const chunks: Uint8Array[] = [];
@@ -199,34 +238,51 @@ export async function fetchBytesAsync(url: string, onProgress?: ProgressCallback
     let parseError: Error | null = null;
 
     parser.onHeadersComplete = (status, hdrs) => {
-        void status;
         const cl = hdrs.find(([n]) => n === 'content-length');
         if (cl) contentLength = parseInt(cl[1]!, 10);
+        dbg('http.fetch', () => `← ${status} (content-length: ${contentLength || 'unknown'}) ${url}`);
     };
     parser.onData = (chunk) => { chunks.push(chunk); loaded += chunk.length; onProgress?.(loaded, contentLength); };
     parser.onError = (e) => { parseError = e; };
 
     while (!parser.isCompleted && !parseError) {
-        const d = await conn.readAsync(128 * 1024);
+        const d = await conn.readAsync(128 * 1024, true);
         if (!d) break;
         parser.feed(d);
     }
 
-    if (parseError) { conn.close(); throw parseError; }
+    if (parseError) {
+        dbg('http.fetch', () => `parse error: ${parseError} ${url}`);
+        conn.close(); throw parseError;
+    }
+    if (!parser.isCompleted) {
+        conn.close();
+        throw new Error(`Response not completed: ${url}`);
+    }
 
     const status = parser.getStatusCode();
+    const reusable = shouldKeepAlive(parser);
     if (status >= 300 && status < 400) {
         const location = parser.getHeaders().find(([n]) => n === 'location')?.[1];
         if (location) {
-            connectionManager.release(cfg, conn);
-            const nextUrl = location.startsWith('/') ? `${parsed.protocol}://${parsed.hostname}:${parsed.port}${location}` : location;
+            if (reusable) connectionManager.release(cfg, conn);
+            else conn.close();
+            const nextUrl = location.startsWith('/') ? `${parsed.protocol}//${parsed.hostname}:${parsed.port}${location}` : location;
+            dbg('http.fetch', () => `redirect ${status} → ${nextUrl}`);
             return fetchBytesAsync(nextUrl, onProgress, httpVersionOrOpts);
         }
     }
 
-    connectionManager.release(cfg, conn);
-    if (status < 200 || status >= 300) throw new Error(`HTTP ${status} ${url}`);
+    if (reusable) connectionManager.release(cfg, conn);
+    else conn.close();
+    if (status < 200 || status >= 300) {
+        const body = mergeChunks(chunks);
+        dbg('http.fetch', () => `error headers: ${JSON.stringify(parser.getHeaders())}`);
+        dbg('http.fetch', () => `error response: ${status} ${url}`);
+        throw new Error(`HTTP ${status} ${url}`);
+    }
 
+    dbg('http.fetch', () => `done: ${loaded} bytes from ${url}`);
     return mergeChunks(chunks);
 }
 
