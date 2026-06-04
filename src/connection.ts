@@ -261,7 +261,7 @@ export class Connection implements ConnectionLike {
                 const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
                 assert(addr, `No IP address found for ${this.config.hostname}`);
                 dbg('http.conn', () => `DNS resolved ${this.config.hostname} → ${addr.ip}`);
-                this.socket.connectSync({ ip: addr.ip, port: this.config.port });
+                (this.socket.connectSync as any)({ ip: addr.ip, port: this.config.port }, this.getTimeoutMs() ?? 30000);
             }
 
             if (isSecure) {
@@ -278,7 +278,7 @@ export class Connection implements ConnectionLike {
                 }
             }
 
-            this.socket.onclose = () => {
+            (this.socket as any).onclose = () => {
                 if (this.state === ConnectionState.CLOSED) return;
                 dbg('http.conn', () => `socket closed: ${this.config.hostname}:${this.config.port}`);
                 this.stopIdleTimer();
@@ -306,8 +306,9 @@ export class Connection implements ConnectionLike {
             dbg('http.conn', () => `connect(async) ${this.config.protocol}//${this.config.hostname}:${this.config.port}`);
 
             if (this.config.client) {
-                this.socket = await this.config.client.connect(
-                    this.config.hostname, this.config.port, isSecure
+                this.socket = await this.withTimeoutAsync(
+                    `connect ${this.config.hostname}:${this.config.port}`,
+                    () => this.config.client.connect(this.config.hostname, this.config.port, isSecure)
                 );
             } else {
                 const addrs = await dnsCache.resolve(this.config.hostname, { family: os.AF_UNSPEC });
@@ -315,24 +316,33 @@ export class Connection implements ConnectionLike {
                 const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
                 assert(addr, `No IP address found for ${this.config.hostname}`);
                 dbg('http.conn', () => `DNS resolved ${this.config.hostname} → ${addr.ip}`);
-                await this.socket.connect({ ip: addr.ip, port: this.config.port });
+                await this.withTimeoutAsync(
+                    `connect ${this.config.hostname}:${this.config.port}`,
+                    () => this.socket.connect({ ip: addr.ip, port: this.config.port })
+                );
             }
 
             if (isSecure) {
                 const clientCtx = this.config.client?.getSSLContext();
                 if (clientCtx) {
                     dbg('http.conn', () => `TLS handshake (custom ctx) for ${this.config.hostname}`);
-                    await this.asyncDriver(this.performTLSHandshake(clientCtx, this.config.hostname));
+                    await this.withTimeoutAsync(
+                        `TLS handshake ${this.config.hostname}:${this.config.port}`,
+                        () => this.asyncDriver(this.performTLSHandshake(clientCtx, this.config.hostname))
+                    );
                 } else {
                     const caPath = await findSystemCaPath();
                     if (!caPath) throw new Error("No system CA bundle found - cannot verify TLS certificates.");
                     dbg('http.conn', () => `TLS handshake for ${this.config.hostname} (ca: ${caPath})`);
                     const ctx = new ssl.Context({ mode: "client", verify: true, ca: caPath });
-                    await this.asyncDriver(this.performTLSHandshake(ctx, this.config.hostname));
+                    await this.withTimeoutAsync(
+                        `TLS handshake ${this.config.hostname}:${this.config.port}`,
+                        () => this.asyncDriver(this.performTLSHandshake(ctx, this.config.hostname))
+                    );
                 }
             }
 
-            this.socket.onclose = () => {
+            (this.socket as any).onclose = () => {
                 if (this.state === ConnectionState.CLOSED) return;
                 dbg('http.conn', () => `socket closed: ${this.config.hostname}:${this.config.port}`);
                 this.stopIdleTimer();
@@ -375,18 +385,20 @@ export class Connection implements ConnectionLike {
 
     async writeAsync(data: Uint8Array): Promise<void> {
         if (data.length === 0) return;
-        if (this.sslPipe) {
-            let offset = 0;
-            while (offset < data.length) {
-                const written = this.sslPipe.write(data.subarray(offset));
-                if (written < 0) throw new Error(`SSL_write failed: ${written}`);
-                offset += written;
+        await this.withTimeoutAsync(`write ${this.config.hostname}:${this.config.port}`, async () => {
+            if (this.sslPipe) {
+                let offset = 0;
+                while (offset < data.length) {
+                    const written = this.sslPipe.write(data.subarray(offset));
+                    if (written < 0) throw new Error(`SSL_write failed: ${written}`);
+                    offset += written;
+                }
+                const encrypted = this.sslPipe.getOutput();
+                if (encrypted) await this.socket.write(new Uint8Array(encrypted));
+            } else {
+                await this.socket.write(data);
             }
-            const encrypted = this.sslPipe.getOutput();
-            if (encrypted) await this.socket.write(new Uint8Array(encrypted));
-        } else {
-            await this.socket.write(data);
-        }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -400,9 +412,12 @@ export class Connection implements ConnectionLike {
     }
 
     readAsync(size = 16384, waitForData = false): Promise<Uint8Array | null> {
-        return this.asyncDriver(this.sslPipe
-            ? this.readSSL(size, waitForData)
-            : this.readPlain(size, waitForData));
+        return this.withTimeoutAsync(
+            `read ${this.config.hostname}:${this.config.port}`,
+            () => this.asyncDriver(this.sslPipe
+                ? this.readSSL(size, waitForData)
+                : this.readPlain(size, waitForData))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -523,16 +538,57 @@ export class Connection implements ConnectionLike {
         while (!next.done) try {
             const op = next.value as IOOp;
             if (op.tag === 'read') {
-                const n = await this.socket.read(op.buf);
+                const n = await this.withTimeoutAsync(
+                    `read ${this.config.hostname}:${this.config.port}`,
+                    () => this.socket.read(op.buf)
+                );
                 next = gen.next(n);
             } else {
-                await this.socket.write(op.data);
+                await this.withTimeoutAsync(
+                    `write ${this.config.hostname}:${this.config.port}`,
+                    () => this.socket.write(op.data)
+                );
                 next = gen.next(undefined);
             }
         } catch (e) {
             next = gen.throw(e);
         }
         return next.value;
+    }
+
+    private getTimeoutMs(): number | null {
+        return typeof this.config.timeout === 'number' && this.config.timeout > 0
+            ? this.config.timeout
+            : null;
+    }
+
+    private withTimeoutAsync<T>(label: string, run: () => Promise<T>): Promise<T> {
+        const timeoutMs = this.getTimeoutMs();
+        if (!timeoutMs) return run();
+        return new Promise<T>((resolve, reject) => {
+            let settled = false;
+            const timeoutId = timers.setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                try { this.close(); } catch {}
+                reject(new Error(`${label} timeout after ${timeoutMs}ms`));
+            }, timeoutMs);
+
+            run().then(
+                (value) => {
+                    if (settled) return;
+                    settled = true;
+                    timers.clearTimeout(timeoutId);
+                    resolve(value);
+                },
+                (error) => {
+                    if (settled) return;
+                    settled = true;
+                    timers.clearTimeout(timeoutId);
+                    reject(error);
+                }
+            );
+        });
     }
 
     private syncDriver<T>(gen: Generator<IOOp, T>): T {

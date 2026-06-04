@@ -1,26 +1,22 @@
-/**
- * Unified HTTP server — protocol-aware.
+﻿/**
+ * Unified HTTP server 鈥?protocol-aware.
  *
- * Accepts connections and negotiates protocol (H1/H2) via ALPN.
- * Routes incoming requests to the handler via the appropriate protocol layer.
+ * Accepts connections and serves HTTP/1.x requests.
+ * Routes incoming requests to the handler via the H1 protocol layer.
  *
  * Architecture:
- *   TCP accept → TLS handshake (with ALPN) → Protocol negotiation →
- *   H1 handler loop  OR  H2 event-driven dispatch
- *
- * For H3 (future): same pattern — add h3.ts implementing ProtocolModule,
- * register in PROTOCOL_MODULES, and the server auto-negotiates.
+ *   TCP accept -> optional TLS handshake -> H1 handler loop
+
  */
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 import { TcpSocket } from "./socket";
 import { h1, H1ServerConnection } from "./h1";
-import { h2 } from "./h2";
 import {
-    type RawRequest, type RawResponse, type ProtocolStream,
+    type RawRequest, type RawResponse,
     type ProtocolConnection, type ProtocolServerConfig, type ProtocolClientConfig,
-    HttpVersion, ALPN, alpnToProtocol,
+    HttpVersion, ALPN,
 } from "./protocol";
 
 const console = import.meta.use('console');
@@ -49,7 +45,7 @@ export interface ServerConfig {
     keepAliveTimeout?: number;
     maxRequestsPerConnection?: number;
     requestTimeout?: number;
-    /** Supported protocols (ordered by preference). Default: H2 + H1 */
+    /** Supported protocols. HTTP/2 is handled by node:http2, not this server. */
     protocols?: HttpVersion[];
 }
 
@@ -75,7 +71,7 @@ export interface HttpResponse {
 }
 
 /* ------------------------------------------------------------------ */
-/* Protocol registry — add H3 here when ready                         */
+/* Protocol registry 鈥?add H3 here when ready                         */
 /* ------------------------------------------------------------------ */
 
 const PROTOCOL_MODULES = new Map<HttpVersion, {
@@ -87,9 +83,7 @@ const PROTOCOL_MODULES = new Map<HttpVersion, {
         negotiate(alpn?: string): HttpVersion | null;
     };
 }>([
-    [HttpVersion.HTTP11, h1],
-    [HttpVersion.HTTP2, { client: h2, server: h2 }],
-    // [HttpVersion.HTTP3, h3],  // future
+    [HttpVersion.HTTP11, h1]
 ]);
 
 /* ------------------------------------------------------------------ */
@@ -117,7 +111,7 @@ export class Server {
             keepAliveTimeout: config.keepAliveTimeout ?? 60000,
             maxRequestsPerConnection: config.maxRequestsPerConnection ?? 100,
             requestTimeout: config.requestTimeout ?? 300000,
-            protocols: config.protocols ?? [HttpVersion.HTTP2, HttpVersion.HTTP11],
+            protocols: config.protocols ?? [HttpVersion.HTTP11],
         };
     }
 
@@ -194,7 +188,6 @@ export class Server {
         const protoConfig: ProtocolServerConfig = {
             secure,
             alpnProtocols: this.config.protocols.map(p => {
-                if (p === HttpVersion.HTTP2) return ALPN.HTTP2;
                 if (p === HttpVersion.HTTP11) return ALPN.HTTP11;
                 return ALPN.HTTP10;
             }),
@@ -210,7 +203,6 @@ export class Server {
 
         // Set up event handlers
         protoConn.on({
-            onstream: (stream) => this.handleStream(stream),
             onError: (err: Error) => console.error(`Protocol error:`, err),
             onClose: () => {
                 this.connections.delete(protoConn);
@@ -218,16 +210,12 @@ export class Server {
             },
         });
 
-        // For H1, drive the request loop directly
-        if (version === HttpVersion.HTTP11) {
-            await this.h1RequestLoop(protoConn as import("./h1").H1ServerConnection);
-        }
-        // For H2, the event-driven model handles everything via onstream
+        await this.h1RequestLoop(protoConn as import("./h1").H1ServerConnection);
     }
 
     private negotiateProtocol(alpnProtocol?: string): HttpVersion | null {
-        if (alpnProtocol) return alpnToProtocol(alpnProtocol);
-        return HttpVersion.HTTP11; // cleartext default
+        if (!alpnProtocol || alpnProtocol === ALPN.HTTP11 || alpnProtocol === ALPN.HTTP10) return HttpVersion.HTTP11;
+        return null;
     }
 
     /* -------------------------------------------------------------- */
@@ -256,25 +244,7 @@ export class Server {
     }
 
     /* -------------------------------------------------------------- */
-    /* H2 stream handler                                               */
-    /* -------------------------------------------------------------- */
-
-    private handleStream(stream: ProtocolStream): void {
-        (async () => {
-            try {
-                const msg = await stream.readMessage() as RawRequest;
-                const httpReq = this.toHttpRequest(msg);
-                const httpRes = this.h2ToHttpResponse(stream);
-                await this.handler(httpReq, httpRes);
-            } catch (err: any) {
-                if (!TcpSocket.isDisconnectError(err)) console.error("H2 stream error:", err);
-                stream.abort();
-            }
-        })().catch(() => {});
-    }
-
-    /* -------------------------------------------------------------- */
-    /* Adapters: Raw ↔ HttpRequest/Response                           */
+    /* Adapters: Raw 鈫?HttpRequest/Response                           */
     /* -------------------------------------------------------------- */
 
     private toHttpRequest(raw: RawRequest): HttpRequest {
@@ -314,41 +284,11 @@ export class Server {
         };
     }
 
-    private h2ToHttpResponse(stream: ProtocolStream): HttpResponse {
-        let headersSent = false;
-        return {
-            status: 200, statusText: 'OK', headers: [] as Array<[string, string]>,
-            writeHead: async (status: number, statusText?: string, headers?: Array<[string, string]>) => {
-                const h2Headers: Array<[string, string]> = [
-                    [':status', String(status)],
-                    ...(headers ?? []),
-                ];
-                const res: RawResponse = {
-                    status, statusText: statusText ?? 'OK',
-                    headers: h2Headers, body: null,
-                };
-                await stream.writeHead(res);
-                headersSent = true;
-            },
-            write: async (chunk: Uint8Array | string) => {
-                if (!headersSent) {
-                    const res: RawResponse = { status: 200, statusText: 'OK', headers: [], body: null };
-                    await stream.writeHead(res);
-                    headersSent = true;
-                }
-                await stream.writeData(typeof chunk === 'string' ? engine.encodeString(chunk) : chunk);
-            },
-            end: async (chunk?: Uint8Array | string) => {
-                if (chunk !== undefined) await stream.writeData(typeof chunk === 'string' ? engine.encodeString(chunk) : chunk);
-                await stream.end();
-            },
-            upgrade: () => { throw new Error('H2 does not support upgrade'); },
-            close: () => stream.close(),
-        };
-    }
 }
 
 export function createServer(handler: RequestHandler, config: ServerConfig): Server {
     return new Server(handler, config);
 }
+
+
 
