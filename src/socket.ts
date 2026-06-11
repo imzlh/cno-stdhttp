@@ -16,12 +16,23 @@ type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 const READ_SIZE = 16384;
 
+export interface ISocket {
+    onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
+    stopReading(): void;
+    read(size?: number): Promise<Uint8Array | null>;
+    write(data: Uint8Array): Promise<void>;
+    serverHandshake(ctx: CModuleSSL.Context): Promise<void>;
+    clientHandshake(ctx: CModuleSSL.Context, servername?: string): Promise<void>;
+    get alpnProtocol(): string | undefined;
+    close(): void;
+}
+
 /**
  * Base TCP socket with optional TLS.
  * Provides plaintext and SSL read/write, TLS handshake (both sides),
  * and callback-based readable events.
  */
-export class TcpSocket {
+export class TcpSocket implements ISocket {
     public  socket:  CModuleStreams.TCP;
     public  sslPipe: CModuleSSL.Pipe | null = null;
     private pending: Uint8Array | null = null;
@@ -39,9 +50,9 @@ export class TcpSocket {
 
     private setupReadCallback(): void {
         try { this.socket.stopRead(); } catch { /* ignore */ }
-        (this.socket as any).onread = (data: Uint8Array | null | undefined, err?: any) => {
+        this.socket.onread = (data: Uint8Array | null | undefined, err?: any) => {
             if (data === undefined) {
-                if (err) { this._readErrHandler?.(err as Error); (this.socket as any).onread = null; }
+                if (err) { this._readErrHandler?.(err as Error); this.socket.onread = null as any; }
                 return;
             }
             if (data === null) { this._readCallback?.(null); return; }
@@ -208,7 +219,7 @@ export class TcpSocket {
 
     static isDisconnectError(err: unknown): boolean {
         if (!(err instanceof Error)) return false;
-        const code = (err as any).code;
+        const code = (err as CModuleError.Error).code;
         return code === error.errno.ECONNRESET || code === error.errno.EPIPE ||
                code === error.errno.EBADF || code === error.errno.ECANCELED;
     }

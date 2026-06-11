@@ -1,12 +1,12 @@
 ﻿/**
- * Unified HTTP server 鈥?protocol-aware.
+ * Core Server Layer
+ * NOTE: currently only h1 is supported
  *
  * Accepts connections and serves HTTP/1.x requests.
  * Routes incoming requests to the handler via the H1 protocol layer.
  *
  * Architecture:
  *   TCP accept -> optional TLS handshake -> H1 handler loop
-
  */
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -18,20 +18,13 @@ import {
     type ProtocolConnection, type ProtocolServerConfig, type ProtocolClientConfig,
     HttpVersion, ALPN,
 } from "./protocol";
+import { assert } from "../utils/assert";
 
 const console = import.meta.use('console');
 const engine = import.meta.use('engine');
 const ssl = import.meta.use('ssl');
 const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
-
-/* ------------------------------------------------------------------ */
-/* Assert helper (self-contained, no external utils dependency)       */
-/* ------------------------------------------------------------------ */
-
-function assert(condition: unknown, message?: string): asserts condition {
-    if (!condition) throw new Error(message ?? "Assertion failed");
-}
 
 /* ------------------------------------------------------------------ */
 /* Types                                                              */
@@ -45,7 +38,6 @@ export interface ServerConfig {
     keepAliveTimeout?: number;
     maxRequestsPerConnection?: number;
     requestTimeout?: number;
-    /** Supported protocols. HTTP/2 is handled by node:http2, not this server. */
     protocols?: HttpVersion[];
 }
 
@@ -70,11 +62,7 @@ export interface HttpResponse {
     close(): void;
 }
 
-/* ------------------------------------------------------------------ */
-/* Protocol registry 鈥?add H3 here when ready                         */
-/* ------------------------------------------------------------------ */
-
-const PROTOCOL_MODULES = new Map<HttpVersion, {
+interface IProtocol {
     client: {
         connect(socket: TcpSocket, config: ProtocolClientConfig): Promise<ProtocolConnection>;
     };
@@ -82,7 +70,13 @@ const PROTOCOL_MODULES = new Map<HttpVersion, {
         accept(socket: TcpSocket, config: ProtocolServerConfig): Promise<ProtocolConnection>;
         negotiate(alpn?: string): HttpVersion | null;
     };
-}>([
+}
+
+/* ------------------------------------------------------------------ */
+/* Protocol registry NOTE: add H3 here when ready                     */
+/* ------------------------------------------------------------------ */
+
+const PROTOCOL_MODULES = new Map<HttpVersion, IProtocol>([
     [HttpVersion.HTTP11, h1]
 ]);
 
@@ -219,7 +213,7 @@ export class Server {
     }
 
     /* -------------------------------------------------------------- */
-    /* H1 request loop                                                 */
+    /* HTTP request loop                                              */
     /* -------------------------------------------------------------- */
 
     private async h1RequestLoop(conn: H1ServerConnection): Promise<void> {
@@ -244,7 +238,7 @@ export class Server {
     }
 
     /* -------------------------------------------------------------- */
-    /* Adapters: Raw 鈫?HttpRequest/Response                           */
+    /* Adapters: Raw for HttpRequest/Response                         */
     /* -------------------------------------------------------------- */
 
     private toHttpRequest(raw: RawRequest): HttpRequest {
@@ -284,11 +278,12 @@ export class Server {
         };
     }
 
+
+    get isSecure(): boolean {
+        return !!this.sslContext;
+    }
 }
 
 export function createServer(handler: RequestHandler, config: ServerConfig): Server {
     return new Server(handler, config);
 }
-
-
-

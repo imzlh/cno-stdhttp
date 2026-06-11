@@ -25,12 +25,9 @@ import {
     HttpVersion, ALPN,
 } from "./protocol";
 import { StreamingDecompressor, StreamingCompressor, parseAcceptEncoding, pickEncoding, shouldCompress } from "./zlib";
+import { assert } from "../utils/assert";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
-
-function assert(condition: unknown, message?: string): asserts condition {
-    if (!condition) throw new Error(message ?? "Assertion failed");
-}
 
 /* ------------------------------------------------------------------ */
 /* HTTP/1.x Request Builder (low-level: strings + bytes, no URL/Headers) */
@@ -135,8 +132,8 @@ export class HttpResponseParser {
         this.parser.onHeadersComplete = () => {
             this.statusCode = this.parser.state.status; this.headersComplete = true;
             if (!this.statusText) this.statusText = strstatus(this.statusCode);
-            const major = (this.parser.state as any).http_major ?? 1;
-            const minor = (this.parser.state as any).http_minor ?? 1;
+            const major = this.parser.state.httpMajor ?? 1;
+            const minor = this.parser.state.httpMinor ?? 1;
             this.httpVersion = `${major}.${minor}`;
             const ce = this.headers.find(([n]) => n === 'content-encoding');
             if (ce) this.decompressor = new StreamingDecompressor(ce[1]);

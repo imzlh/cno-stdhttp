@@ -40,7 +40,8 @@ class DnsCache {
         const key = `${hostname}:${family}`;
         const cached = this.cache.get(key);
         if (cached && Date.now() < cached.expiresAt) return cached.addresses;
-        const addrs = engine.waitPromise(dns.resolve(hostname, { family }));
+        // Use sync DNS resolution if available, otherwise return empty
+        const addrs = dns.resolveSync?.(hostname, { family }) ?? [];
         if (!addrs?.length) return addrs;
         const ttl = this.inferTtl(addrs);
         this.cache.set(key, { addresses: addrs, expiresAt: Date.now() + ttl });
@@ -67,7 +68,7 @@ class DnsCache {
     }
 
     private inferTtl(addrs: DnsAddress[]): number {
-        const ttls = addrs.map(a => (a as any).ttl).filter((t): t is number => typeof t === "number" && t > 0);
+        const ttls = addrs.map(a => a.ttl).filter((t): t is number => typeof t === "number" && t > 0);
         return ttls.length > 0 ? Math.min(...ttls) * 1000 : DEFAULT_TTL_MS;
     }
 }

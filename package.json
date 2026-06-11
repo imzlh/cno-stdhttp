@@ -1,36 +1,33 @@
 ﻿{
-    "name":  "@cnojs/http",
-    "version":  "1.0.0",
-    "description":  "Low-level HTTP protocol library 鈥?no WebAPI dependencies",
-    "type":  "module",
-    "main":  "src/index.ts",
-    "exports":  {
-                    ".":  "./src/index.ts",
-                    "./socket":  "./src/socket.ts",
-                    "./connection":  "./src/connection.ts",
-                    "./dns-cache":  "./src/dns-cache.ts",
-                    "./fetch":  "./src/fetch.ts",
-                    "./client":  "./src/client.ts",
-                    "./zlib":  "./src/zlib.ts",
-                    "./protocol":  "./src/protocol.ts",
-                    "./h1":  "./src/h1.ts",
-                    "./ext-h2":  "./ext-h2/http2.d.ts",
-                    "./server":  "./src/server.ts",
-                    "./debug":  "./src/debug.ts",
-                    "./process":  "./src/process.ts"
-                },
-    "keywords":  [
-                     "http",
-                     "h1",
-                     "protocol",
-                     "server",
-                     "client",
-                     "curl"
-                 ],
-    "author":  "",
-    "license":  "MIT",
-    "devDependencies":  {
-                            "typescript":  "^5.9.3",
-                            "@types/node":  "^25.3.0"
-                        }
+    "name": "@cnojs/http",
+    "version": "1.0.0",
+    "description": "Low-level HTTP protocol library 鈥?no WebAPI dependencies",
+    "type": "module",
+    "main": "src/index.ts",
+    "exports": {
+        ".": "./src/index.ts",
+        "./socket": "./src/socket.ts",
+        "./dns-cache": "./src/dns-cache.ts",
+        "./zlib": "./src/zlib.ts",
+        "./protocol": "./src/protocol.ts",
+        "./h1": "./src/h1.ts",
+        "./ext-h2": "./ext-h2/http2.d.ts",
+        "./server": "./src/server.ts",
+        "./debug": "./src/debug.ts",
+        "./process": "./src/process.ts"
+    },
+    "keywords": [
+        "http",
+        "h1",
+        "protocol",
+        "server",
+        "client",
+        "curl"
+    ],
+    "author": "",
+    "license": "MIT",
+    "devDependencies": {
+        "typescript": "^5.9.3",
+        "@types/node": "^25.3.0"
+    }
 }

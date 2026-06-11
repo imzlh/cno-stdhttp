@@ -2,11 +2,6 @@
  * Protocol abstraction layer — defines the interface that all HTTP protocol
  * implementations (H1, H2, H3) must satisfy.
  *
- * NO WebAPI dependencies. All types use primitives:
- * - Headers → Array<[string, string]>
- * - Body → Uint8Array | null
- * - No URL, Headers, Request, Response, ReadableStream, EventTarget, etc.
- *
  * Architecture:
  * ┌─────────────────────────────────────────────────────────────────┐
  * │                   CNO Secondary Wrapping Layer                   │
@@ -39,10 +34,10 @@
 /* ------------------------------------------------------------------ */
 
 export enum HttpVersion {
-    HTTP10 = '1.0',
-    HTTP11 = '1.1',
-    HTTP2  = '2',
-    HTTP3  = '3',
+    HTTP10 = 0,
+    HTTP11 = 1,
+    HTTP2  = 2,
+    HTTP3  = 3,
 }
 
 export const ALPN = {
