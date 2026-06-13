@@ -94,6 +94,14 @@ export class Server {
     private listening = false;
     private draining = false;
     private drainResolve: (() => void) | null = null;
+    private _drainResolved = false;
+
+    private _completeDrain(): void {
+        if (!this._drainResolved && this.drainResolve) {
+            this._drainResolved = true;
+            this.drainResolve();
+        }
+    }
 
     constructor(handler: RequestHandler, config: ServerConfig) {
         this.handler = handler;
@@ -152,7 +160,7 @@ export class Server {
         const drainPromise = new Promise<void>(resolve => { this.drainResolve = resolve; });
         this.listener?.close(); this.listener = null; this.listening = false;
         for (const conn of this.connections) conn.close();
-        if (this.connections.size === 0) this.drainResolve!();
+        if (this.connections.size === 0) this._completeDrain();
         return drainPromise;
     }
 
@@ -200,11 +208,17 @@ export class Server {
             onError: (err: Error) => console.error(`Protocol error:`, err),
             onClose: () => {
                 this.connections.delete(protoConn);
-                if (this.draining && this.connections.size === 0) this.drainResolve?.();
+                if (this.draining && this.connections.size === 0) this._completeDrain();
             },
         });
 
         await this.h1RequestLoop(protoConn as import("./h1").H1ServerConnection);
+        // Non-upgraded connections: close so onClose fires and cleans up the set.
+        // Upgraded connections (WebSocket etc.) stay in the set; their close() is
+        // called either by the protocol layer or by shutdown().
+        if (!(protoConn as import("./h1").H1ServerConnection).isUpgraded) {
+            protoConn.close();
+        }
     }
 
     private negotiateProtocol(alpnProtocol?: string): HttpVersion | null {
@@ -264,16 +278,19 @@ export class Server {
                 if (chunk !== undefined) await conn.writeData(typeof chunk === 'string' ? engine.encodeString(chunk) : chunk);
                 await conn.endResponse();
             },
-            upgrade: () => ({
-                socket: conn.socket,
-                sslPipe: conn.socket.sslPipe,
-                write: (data: Uint8Array) => conn.socket.write(data),
-                read: (size?: number) => conn.socket.read(size),
-                onReadable: (cb: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void) => conn.socket.onReadable(cb, errHandler),
-                stopReading: () => conn.socket.stopReading(),
-                close: () => conn.close(),
-                isClosed: () => conn.isClosed(),
-            }),
+            upgrade: () => {
+                conn.markUpgraded();
+                return {
+                    socket: conn.socket,
+                    sslPipe: conn.socket.sslPipe,
+                    write: (data: Uint8Array) => conn.socket.write(data),
+                    read: (size?: number) => conn.socket.read(size),
+                    onReadable: (cb: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void) => conn.socket.onReadable(cb, errHandler),
+                    stopReading: () => conn.socket.stopReading(),
+                    close: () => conn.close(),
+                    isClosed: () => conn.isClosed(),
+                };
+            },
             close: () => conn.close(),
         };
     }

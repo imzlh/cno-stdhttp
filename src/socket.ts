@@ -189,7 +189,11 @@ export class TcpSocket implements ISocket {
     /* Close                                                          */
     /* -------------------------------------------------------------- */
 
+    private _closed = false;
+
     close(): void {
+        if (this._closed) return;
+        this._closed = true;
         this.pending = null;
         this.stopReading();
         try { this.sslPipe?.shutdown(); } catch { /* ignore */ }

@@ -221,6 +221,7 @@ export class H1ServerConnection implements ProtocolConnection {
     private compressor: StreamingCompressor | null = null;
     private requestCount = 0; private keepAlive = true; private requestHttpVersion = '1.1';
     private _closed = false;
+    private _upgraded = false;
     private events: ProtocolConnectionEvents = { onstream: null, onError: null, onClose: null, onGoaway: null, onSettings: null };
 
     constructor(socket: TcpSocket, secure: boolean) { this.socket = socket; this.secure = secure; this.parser = new http.Parser(http.REQUEST); this.setupParser(); }
@@ -295,7 +296,7 @@ export class H1ServerConnection implements ProtocolConnection {
         const res: RawResponse = { status: 200, statusText: 'OK', headers: [], body: null };
         await handler(req, res);
         this.parser.reset(http.REQUEST); this.requestCount++;
-        return this.keepAlive;
+        return this._upgraded ? false : this.keepAlive;
     }
 
     async writeHead(status: number, statusText: string, headers: Array<[string, string]>): Promise<void> {
@@ -345,8 +346,15 @@ export class H1ServerConnection implements ProtocolConnection {
     createStream(): ProtocolStream { return new H1Stream(this, true); }
     on(events: Partial<ProtocolConnectionEvents>): void { Object.assign(this.events, events); }
     goaway(): void { this.close(); }
-    close(): void { this._closed = true; this.socket.close(); }
-    destroy(): void { this._closed = true; this.socket.close(); }
+    close(): void {
+        if (this._closed) return;
+        this._closed = true;
+        this.socket.close();
+        this.events.onClose?.();
+    }
+    destroy(): void { this.close(); }
+    markUpgraded(): void { this._upgraded = true; this.keepAlive = false; }
+    get isUpgraded(): boolean { return this._upgraded; }
     async readRequest(): Promise<RawRequest> { return { method: this.method, url: this.url, httpVersion: this.requestHttpVersion, headers: this.reqHeaders, body: null }; }
 }
 
