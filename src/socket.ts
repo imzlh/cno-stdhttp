@@ -58,10 +58,18 @@ export class TcpSocket implements ISocket {
             if (data === null) { this._readCallback?.(null); return; }
             this._readCallback?.(data);
             if (this._readCallback) {
-                try { this.socket.startRead(); } catch (e: any) { if (e.code !== 'EALREADY') throw e; }
+                try {
+                    this.socket.startRead();
+                } catch (e: any) {
+                    if ((e as CModuleError.Error).code !== error.errno.EALREADY) throw e;
+                }
             }
         };
-        try { this.socket.startRead(); } catch (e: any) { if (e.code !== 'EALREADY') throw e; }
+        try {
+            this.socket.startRead();
+        } catch (e) {
+            if ((e as CModuleError.Error).code !== error.errno.EALREADY) throw e;
+        }
     }
 
     onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void {

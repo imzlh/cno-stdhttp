@@ -24,7 +24,9 @@
 
 #include "http2.h"
 
-JSClassID h2session_class_id;
+#include <threads.h>
+
+thread_local JSClassID h2session_class_id;
 
 /* ── Helpers ──────────────────────────────────────────────────── */
 

@@ -301,14 +301,24 @@ export class H1ServerConnection implements ProtocolConnection {
 
     async writeHead(status: number, statusText: string, headers: Array<[string, string]>): Promise<void> {
         if (this.headersSent) throw new Error("Headers already sent");
-        const te = headers.find(([n]) => n === 'transfer-encoding')?.[1];
+        const headerValue = (name: string): string | undefined =>
+            headers.find(([n]) => n.toLowerCase() === name)?.[1];
+        const hasHeader = (name: string): boolean =>
+            headers.some(([n]) => n.toLowerCase() === name);
+        const te = headerValue('transfer-encoding');
         if (te?.toLowerCase().includes('chunked')) this.chunkedEncoding = true;
-        if (this.compressEncoding && !headers.find(([n]) => n === 'content-encoding') && !this.chunkedEncoding) {
-            const ct = headers.find(([n]) => n === 'content-type')?.[1];
-            if (!ct || shouldCompress(ct)) { this.compressor = new StreamingCompressor(this.compressEncoding); headers.push(['content-encoding', this.compressEncoding]); headers.push(['transfer-encoding', 'chunked']); headers = headers.filter(([n]) => n !== 'content-length'); this.chunkedEncoding = true; }
+        if (this.compressEncoding && !hasHeader('content-encoding') && !this.chunkedEncoding) {
+            const ct = headerValue('content-type');
+            if (!ct || shouldCompress(ct)) {
+                this.compressor = new StreamingCompressor(this.compressEncoding);
+                headers.push(['content-encoding', this.compressEncoding]);
+                headers.push(['transfer-encoding', 'chunked']);
+                headers = headers.filter(([n]) => n.toLowerCase() !== 'content-length');
+                this.chunkedEncoding = true;
+            }
         }
         let raw = `HTTP/${this.requestHttpVersion} ${status} ${statusText}\r\n`;
-        if (!headers.find(([n]) => n === 'connection')) raw += this.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        if (!hasHeader('connection')) raw += this.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
         for (const [k, v] of headers) raw += `${k}: ${v}\r\n`;
         raw += "\r\n";
         await this.socket.write(engine.encodeString(raw));
