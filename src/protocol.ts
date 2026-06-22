@@ -61,7 +61,7 @@ export interface RawRequest {
     method: string;
     url: string;
     headers: RawHeaders;
-    body: Uint8Array | null;
+    body: Uint8Array | ReadableStream<Uint8Array> | null;
     httpVersion: string;
 }
 

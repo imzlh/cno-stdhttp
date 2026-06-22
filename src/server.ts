@@ -48,7 +48,7 @@ export interface HttpRequest {
     url: string;
     httpVersion: string;
     headers: Array<[string, string]>;
-    body: Uint8Array | null;
+    body: Uint8Array | ReadableStream<Uint8Array> | null;
 }
 
 export interface HttpResponse {
@@ -258,7 +258,7 @@ export class Server {
     private toHttpRequest(raw: RawRequest): HttpRequest {
         return {
             method: raw.method, url: raw.url, httpVersion: raw.httpVersion,
-            headers: raw.headers, body: raw.body as Uint8Array | null,
+            headers: raw.headers, body: raw.body as Uint8Array | ReadableStream<Uint8Array> | null,
         };
     }
 

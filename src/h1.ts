@@ -1,5 +1,5 @@
 /**
- * HTTP/1.x protocol implementation — low-level, no WebAPI dependencies.
+ * HTTP/1.x protocol implementation 闁?low-level, no WebAPI dependencies.
  *
  * Handles:
  * - Request building (from raw strings/bytes, no URL/Headers types)
@@ -242,6 +242,7 @@ export class H1ServerConnection implements ProtocolConnection {
             this.method = HTTP_METHODS[this.parser.state.method] ?? 'UNKNOWN'; this.headersOk = true;
             const connH = this.reqHeaders.find(([n]) => n === 'connection')?.[1]?.toLowerCase();
             const ver = `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`;
+            this.requestHttpVersion = ver;
             this.keepAlive = ver === '1.1' ? connH !== 'close' : connH === 'keep-alive';
             const ae = this.reqHeaders.find(([n]) => n === 'accept-encoding')?.[1];
             if (ae) this.compressEncoding = pickEncoding(parseAcceptEncoding(ae));
@@ -259,25 +260,72 @@ export class H1ServerConnection implements ProtocolConnection {
         this.expectBody = false; this.contentLength = 0; this.chunked = false; this.bodyRead = 0;
         this.headersSent = false; this.responseEnded = false;
         this.chunkedEncoding = false; this.compressEncoding = null; this.compressor = null;
+        this.requestHttpVersion = '1.1';
 
-        // Set up body collection before any execute() — headers and body may arrive
-        // in the same TCP segment (coalescing), so we can't set this up after headers.
-        const bodyChunks: Uint8Array[] = [];
+        const pendingBodyChunks: Uint8Array[] = [];
         let messageDone = false;
-        this.bodyCtrl = (chunk) => bodyChunks.push(chunk);
-        this.bodyEnd  = () => { messageDone = true; this.bodyCtrl = null; this.bodyEnd = null; };
+        let requestStarted = false;
+        let bodyClosed = false;
+        let bodyController: ReadableStreamDefaultController<Uint8Array> | null = null;
+        let handlerPromise: Promise<void> | null = null;
 
-        // Single loop: reads until we have headers (for GET) or full message (for POST).
+        const flushPendingBody = () => {
+            if (!bodyController) return;
+            while (pendingBodyChunks.length > 0) bodyController.enqueue(pendingBodyChunks.shift()!);
+            if (bodyClosed) {
+                bodyController.close();
+                bodyController = null;
+            }
+        };
+
+        this.bodyCtrl = (chunk) => {
+            if (bodyController) bodyController.enqueue(chunk);
+            else pendingBodyChunks.push(chunk);
+        };
+        this.bodyEnd = () => {
+            messageDone = true;
+            bodyClosed = true;
+            if (bodyController) {
+                bodyController.close();
+                bodyController = null;
+            }
+            this.bodyCtrl = null;
+            this.bodyEnd = null;
+        };
+
+        const startHandler = () => {
+            if (requestStarted || !this.headersOk) return;
+            requestStarted = true;
+            const body = this.expectBody
+                ? new ReadableStream<Uint8Array>({
+                    start: (controller) => {
+                        bodyController = controller;
+                        flushPendingBody();
+                    }
+                })
+                : null;
+            const req: RawRequest = {
+                method: this.method,
+                url: this.url,
+                httpVersion: this.requestHttpVersion,
+                headers: this.reqHeaders,
+                body,
+            };
+            const res: RawResponse = { status: 200, statusText: 'OK', headers: [], body: null };
+            handlerPromise = Promise.resolve(handler(req, res));
+        };
+
         while (true) {
-            // After headers: if no body expected the message is logically done.
-            if (this.headersOk && !this.expectBody) break;
-            // After headers + body via coalesced packet.
-            if (messageDone) break;
+            if (this.headersOk) {
+                startHandler();
+                if (!this.expectBody || messageDone) break;
+            }
 
             const data = await this.socket.read();
             if (data === null) {
                 if (!this.headersOk) return false;
-                break; // EOF mid-body — handler will see partial body
+                if (this.bodyEnd) this.bodyEnd();
+                break;
             }
             if (data.length === 0) continue;
 
@@ -292,22 +340,18 @@ export class H1ServerConnection implements ProtocolConnection {
                     this.keepAlive = false;
                     break;
                 }
+                if (bodyController) {
+                    const err = new Error(`Parse error: ${r.reason}`);
+                    (bodyController as ReadableStreamDefaultController<Uint8Array> & { error?: (reason?: any) => void }).error?.(err);
+                    bodyController = null;
+                }
                 throw new Error(`Parse error: ${r.reason}`);
             }
         }
 
         this.bodyCtrl = null; this.bodyEnd = null;
-
-        let body: Uint8Array | null = null;
-        if (bodyChunks.length > 0) {
-            const total = bodyChunks.reduce((s, c) => s + c.length, 0);
-            body = new Uint8Array(total); let off = 0;
-            for (const c of bodyChunks) { body.set(c, off); off += c.length; }
-        }
-
-        const req: RawRequest = { method: this.method, url: this.url, httpVersion: `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`, headers: this.reqHeaders, body };
-        const res: RawResponse = { status: 200, statusText: 'OK', headers: [], body: null };
-        await handler(req, res);
+        startHandler();
+        await handlerPromise;
         this.parser.reset(http.REQUEST); this.requestCount++;
         return this._upgraded ? false : this.keepAlive;
     }
@@ -472,3 +516,5 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
 const HTTP_METHODS = ["DELETE","GET","HEAD","POST","PUT","CONNECT","OPTIONS","TRACE","COPY","LOCK","MKCOL","MOVE","PROPFIND","PROPPATCH","SEARCH","UNLOCK","BIND","REBIND","UNBIND","ACL","REPORT","MKACTIVITY","CHECKOUT","MERGE","MSEARCH","NOTIFY","SUBSCRIBE","UNSUBSCRIBE","PATCH","PURGE","MKCALENDAR","LINK","UNLINK"] as const;
 const STATUS_TEXT_MAP: Record<number, string> = { 100:'Continue',101:'Switching Protocols',200:'OK',201:'Created',204:'No Content',301:'Moved Permanently',302:'Found',304:'Not Modified',400:'Bad Request',401:'Unauthorized',403:'Forbidden',404:'Not Found',500:'Internal Server Error',502:'Bad Gateway',503:'Service Unavailable' };
 function strstatus(code: number): string { return STATUS_TEXT_MAP[code] ?? `Status ${code}`; }
+
+
