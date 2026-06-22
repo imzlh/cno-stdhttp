@@ -280,12 +280,19 @@ export class Server {
             },
             upgrade: () => {
                 conn.markUpgraded();
+                let pending = conn.takeUpgradeLeftover();
                 return {
                     socket: conn.socket,
                     sslPipe: conn.socket.sslPipe,
                     write: (data: Uint8Array) => conn.socket.write(data),
-                    read: (size?: number) => conn.socket.read(size),
-                    onReadable: (cb: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void) => conn.socket.onReadable(cb, errHandler),
+                    read: (size?: number) => {
+                        if (pending && pending.byteLength > 0) { const data = pending; pending = null; return Promise.resolve(data); }
+                        return conn.socket.read(size);
+                    },
+                    onReadable: (cb: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void) => {
+                        conn.socket.onReadable(cb, errHandler);
+                        if (pending && pending.byteLength > 0) { const data = pending; pending = null; cb(data); }
+                    },
                     stopReading: () => conn.socket.stopReading(),
                     close: () => conn.close(),
                     isClosed: () => conn.isClosed(),

@@ -148,10 +148,14 @@ export class HttpResponseParser {
         this.parser.onMessageComplete = () => { this.completed = true; this.onComplete?.(); };
     }
 
-    feed(data: Uint8Array): void {
+    feed(data: Uint8Array): any {
         try {
             const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.length + data.byteOffset));
-            if (result.errno !== 0) { const e = new Error(`HTTP parse error: ${result.reason}`); if (this.onError) this.onError(e); else throw e; }
+            if (result.errno !== 0) {
+                if (result.name === 'HPE_PAUSED_UPGRADE') return result;
+                const e = new Error(`HTTP parse error: ${result.reason}`); if (this.onError) this.onError(e); else throw e;
+            }
+            return result;
         } catch (err) { if (this.onError) this.onError(err as Error); else throw err; }
     }
 
@@ -222,6 +226,7 @@ export class H1ServerConnection implements ProtocolConnection {
     private requestCount = 0; private keepAlive = true; private requestHttpVersion = '1.1';
     private _closed = false;
     private _upgraded = false;
+    private upgradeLeftover: Uint8Array | null = null;
     private events: ProtocolConnectionEvents = { onstream: null, onError: null, onClose: null, onGoaway: null, onSettings: null };
 
     constructor(socket: TcpSocket, secure: boolean) { this.socket = socket; this.secure = secure; this.parser = new http.Parser(http.REQUEST); this.setupParser(); }
@@ -278,7 +283,15 @@ export class H1ServerConnection implements ProtocolConnection {
 
             const r = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
             if (r.errno !== 0) {
-                if (r.name === 'HPE_PAUSED_UPGRADE') { this.keepAlive = false; break; }
+                if (r.name === 'HPE_PAUSED_UPGRADE') {
+                    const upgradeResult = r as any;
+                    const consumed = Number(upgradeResult?.nread ?? upgradeResult?.offset ?? upgradeResult?.consumed ?? data.byteLength);
+                    if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
+                        this.upgradeLeftover = data.subarray(consumed);
+                    }
+                    this.keepAlive = false;
+                    break;
+                }
                 throw new Error(`Parse error: ${r.reason}`);
             }
         }
@@ -305,9 +318,19 @@ export class H1ServerConnection implements ProtocolConnection {
             headers.find(([n]) => n.toLowerCase() === name)?.[1];
         const hasHeader = (name: string): boolean =>
             headers.some(([n]) => n.toLowerCase() === name);
+        const isBodyForbiddenStatus = (status >= 100 && status < 200) || status === 204 || status === 304;
+        if (isBodyForbiddenStatus) {
+            headers = headers.filter(([n]) => {
+                const key = n.toLowerCase();
+                return key !== 'content-length' && key !== 'content-encoding' && key !== 'transfer-encoding';
+            });
+            this.chunkedEncoding = false;
+            this.compressor = null;
+            this.compressEncoding = null;
+        }
         const te = headerValue('transfer-encoding');
         if (te?.toLowerCase().includes('chunked')) this.chunkedEncoding = true;
-        if (this.compressEncoding && !hasHeader('content-encoding') && !this.chunkedEncoding) {
+        if (!isBodyForbiddenStatus && this.compressEncoding && !hasHeader('content-encoding') && !this.chunkedEncoding) {
             const ct = headerValue('content-type');
             if (!ct || shouldCompress(ct)) {
                 this.compressor = new StreamingCompressor(this.compressEncoding);
@@ -365,6 +388,7 @@ export class H1ServerConnection implements ProtocolConnection {
     destroy(): void { this.close(); }
     markUpgraded(): void { this._upgraded = true; this.keepAlive = false; }
     get isUpgraded(): boolean { return this._upgraded; }
+    takeUpgradeLeftover(): Uint8Array | null { const v = this.upgradeLeftover; this.upgradeLeftover = null; return v; }
     async readRequest(): Promise<RawRequest> { return { method: this.method, url: this.url, httpVersion: this.requestHttpVersion, headers: this.reqHeaders, body: null }; }
 }
 
