@@ -24,6 +24,11 @@ const DEFAULT_TTL_MS = 300_000;
 
 class DnsCache {
     private cache = new Map<string, CacheEntry>();
+    private readonly maxSize: number;
+
+    constructor(maxSize = 256) {
+        this.maxSize = maxSize;
+    }
 
     async resolve(hostname: string, options?: { family?: number }): Promise<DnsAddress[]> {
         const key = `${hostname}:${options?.family ?? 0}`;
@@ -32,6 +37,7 @@ class DnsCache {
         const addrs = await dns.resolve(hostname, { family: options?.family ?? 0 });
         if (!addrs?.length) return addrs;
         const ttl = this.inferTtl(addrs);
+        this.evictIfFull(key);
         this.cache.set(key, { addresses: addrs, expiresAt: Date.now() + ttl });
         return addrs;
     }
@@ -44,6 +50,7 @@ class DnsCache {
         const addrs = dns.resolveSync?.(hostname, { family }) ?? [];
         if (!addrs?.length) return addrs;
         const ttl = this.inferTtl(addrs);
+        this.evictIfFull(key);
         this.cache.set(key, { addresses: addrs, expiresAt: Date.now() + ttl });
         return addrs;
     }
@@ -70,6 +77,14 @@ class DnsCache {
     private inferTtl(addrs: DnsAddress[]): number {
         const ttls = addrs.map(a => a.ttl).filter((t): t is number => typeof t === "number" && t > 0);
         return ttls.length > 0 ? Math.min(...ttls) * 1000 : DEFAULT_TTL_MS;
+    }
+
+    /** Evict the oldest entry if at capacity (skips `skipKey` to avoid re-inserting it). */
+    private evictIfFull(skipKey: string): void {
+        if (this.cache.size < this.maxSize) return;
+        for (const key of this.cache.keys()) {
+            if (key !== skipKey) { this.cache.delete(key); return; }
+        }
     }
 }
 
