@@ -7,7 +7,7 @@
  */
 
 const dns = import.meta.use("dns");
-const engine = import.meta.use("engine");
+const os = import.meta.use("os");
 
 export interface DnsAddress {
     ip: string;
@@ -34,7 +34,9 @@ class DnsCache {
         const key = `${hostname}:${options?.family ?? 0}`;
         const cached = this.cache.get(key);
         if (cached && Date.now() < cached.expiresAt) return cached.addresses;
-        const addrs = await dns.resolve(hostname, { family: options?.family ?? 0 });
+        const addrs = await dns.resolve(hostname, {
+            family: options?.family == 4 ? os.AF_INET : options?.family == 6 ? os.AF_INET6 : os.AF_UNSPEC
+        });
         if (!addrs?.length) return addrs;
         const ttl = this.inferTtl(addrs);
         this.evictIfFull(key);

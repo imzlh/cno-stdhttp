@@ -227,6 +227,7 @@ export class H1ServerConnection implements ProtocolConnection {
     private _closed = false;
     private _upgraded = false;
     private upgradeLeftover: Uint8Array | null = null;
+    private pendingInput: Uint8Array | null = null;
     private events: ProtocolConnectionEvents = { onstream: null, onError: null, onClose: null, onGoaway: null, onSettings: null };
 
     constructor(socket: TcpSocket, secure: boolean) { this.socket = socket; this.secure = secure; this.parser = new http.Parser(http.REQUEST); this.setupParser(); }
@@ -252,7 +253,14 @@ export class H1ServerConnection implements ProtocolConnection {
             else if (te?.toLowerCase().includes('chunked')) { this.chunked = true; this.expectBody = true; }
         };
         this.parser.onBody = (buf, off, len) => { if (this.bodyCtrl) this.bodyCtrl(new Uint8Array(buf as ArrayBuffer).slice(off, off + len)); this.bodyRead += len; if (!this.chunked && this.bodyRead >= this.contentLength && this.bodyEnd) { this.bodyEnd(); this.bodyCtrl = null; this.bodyEnd = null; } };
-        this.parser.onMessageComplete = () => { if (this.bodyEnd) { this.bodyEnd(); this.bodyCtrl = null; this.bodyEnd = null; } };
+        this.parser.onMessageComplete = () => {
+            if (this.bodyEnd) {
+                this.bodyEnd();
+                this.bodyCtrl = null;
+                this.bodyEnd = null;
+            }
+            this.parser.pause();
+        };
     }
 
     async handleRequest(handler: (req: RawRequest, res: RawResponse) => void | Promise<void>): Promise<boolean> {
@@ -321,7 +329,9 @@ export class H1ServerConnection implements ProtocolConnection {
                 if (!this.expectBody || messageDone) break;
             }
 
-            const data = await this.socket.read();
+            let data = this.pendingInput;
+            this.pendingInput = null;
+            if (data === null) data = await this.socket.read();
             if (data === null) {
                 if (!this.headersOk) return false;
                 if (this.bodyEnd) this.bodyEnd();
@@ -331,12 +341,16 @@ export class H1ServerConnection implements ProtocolConnection {
 
             const r = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
             if (r.errno !== 0) {
+                const consumed = Number((r as any).bytesConsumed ?? data.byteLength);
+                if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
+                    this.pendingInput = data.subarray(consumed);
+                }
+                if (r.name === 'HPE_PAUSED') {
+                    break;
+                }
                 if (r.name === 'HPE_PAUSED_UPGRADE') {
-                    const upgradeResult = r as any;
-                    const consumed = Number(upgradeResult?.nread ?? upgradeResult?.offset ?? upgradeResult?.consumed ?? data.byteLength);
-                    if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
-                        this.upgradeLeftover = data.subarray(consumed);
-                    }
+                    this.upgradeLeftover = this.pendingInput;
+                    this.pendingInput = null;
                     this.keepAlive = false;
                     break;
                 }

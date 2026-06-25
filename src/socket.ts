@@ -190,7 +190,7 @@ export class TcpSocket implements ISocket {
      * Returns undefined if TLS is not active or ALPN was not negotiated.
      */
     get alpnProtocol(): string | undefined {
-        return this.sslPipe?.alpnProtocol?.() ?? undefined;
+        return this.sslPipe?.alpnProtocol ?? undefined;
     }
 
     /* -------------------------------------------------------------- */
