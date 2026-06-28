@@ -57,11 +57,14 @@ export type AlpnProtocol = typeof ALPN[keyof typeof ALPN];
 /** Headers as raw [name, value] pairs (low-level, no WebAPI Headers) */
 export type RawHeaders = Array<[string, string]>;
 
+/** Low-level stream data source (for body) */
+export type StreamPoll = () => Promise<Uint8Array | null>;
+
 export interface RawRequest {
     method: string;
     url: string;
     headers: RawHeaders;
-    body: Uint8Array | ReadableStream<Uint8Array> | null;
+    body: StreamPoll | null;
     httpVersion: string;
 }
 

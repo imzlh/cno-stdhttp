@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Core Server Layer
  * NOTE: currently only h1 is supported
  *
@@ -17,11 +17,13 @@ import {
     type RawRequest, type RawResponse,
     type ProtocolConnection, type ProtocolServerConfig, type ProtocolClientConfig,
     HttpVersion, ALPN,
+    type StreamPoll
 } from "./protocol";
 import { assert } from "../utils/assert";
 
 const console = import.meta.use('console');
 const engine = import.meta.use('engine');
+const os = import.meta.use('os');
 const ssl = import.meta.use('ssl');
 const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
@@ -48,7 +50,7 @@ export interface HttpRequest {
     url: string;
     httpVersion: string;
     headers: Array<[string, string]>;
-    body: Uint8Array | ReadableStream<Uint8Array> | null;
+    body: StreamPoll | null;
 }
 
 export interface HttpResponse {
@@ -122,9 +124,13 @@ export class Server {
         if (this.config.cert && this.config.key) {
             this.sslContext = new ssl.Context({ mode: "server", cert: this.config.cert, key: this.config.key });
         }
-        this.listener = new streams.TCP();
+        const family = this.config.hostname.includes(':') ? os.AF_INET6 : os.AF_INET;
+        this.listener = new streams.TCP(family);
         this.listener.bind({ ip: this.config.hostname, port: this.config.port });
         this.listener.listen(511);
+        // Update config with the actual bound port (OS-assigned when port was 0)
+        const sn = this.listener.sockname;
+        if (sn) this.config.port = sn.port;
         this.listening = true;
     }
 
@@ -236,18 +242,23 @@ export class Server {
         while (keepAlive && !conn.isClosed()) {
             const timeoutMs = firstRequest ? this.config.requestTimeout : this.config.keepAliveTimeout;
             let timedOut = false;
-            const tid = timers.setTimeout(() => { timedOut = true; conn.close(); }, timeoutMs);
+            let tid: any = timers.setTimeout(() => { timedOut = true; conn.close(); }, timeoutMs);
             try {
                 keepAlive = await conn.handleRequest(async (req: RawRequest, _res: RawResponse) => {
                     const httpReq = this.toHttpRequest(req);
                     const httpRes = this.toHttpResponse(conn);
                     await this.handler(httpReq, httpRes);
+                }, () => {
+                    // Headers arrived: the connection is no longer idle. Cancel the
+                    // keep-alive/request timer so it bounds only the idle wait for
+                    // the next request — not body streaming or handler execution.
+                    if (tid !== null) { timers.clearTimeout(tid); tid = null; }
                 });
                 firstRequest = false;
             } catch (err: any) {
                 if (!TcpSocket.isDisconnectError(err) && !timedOut) console.error("Request error:", err);
                 keepAlive = false;
-            } finally { timers.clearTimeout(tid); }
+            } finally { if (tid !== null) timers.clearTimeout(tid); }
         }
     }
 
@@ -256,15 +267,17 @@ export class Server {
     /* -------------------------------------------------------------- */
 
     private toHttpRequest(raw: RawRequest): HttpRequest {
-        return {
+        const request = {
             method: raw.method, url: raw.url, httpVersion: raw.httpVersion,
-            headers: raw.headers, body: raw.body as Uint8Array | ReadableStream<Uint8Array> | null,
+            headers: raw.headers, body: raw.body as StreamPoll | null,
         };
+        Reflect.set(request as object, '__cnoTcp', (raw as any).__cnoTcp);
+        return request;
     }
 
     private toHttpResponse(conn: any): HttpResponse {
         let headersSent = false;
-        return {
+        const response = {
             status: 200, statusText: 'OK', headers: [] as Array<[string, string]>,
             writeHead: async (status: number, statusText?: string, headers?: Array<[string, string]>) => {
                 await conn.writeHead(status, statusText ?? 'OK', headers ?? []);
@@ -300,6 +313,8 @@ export class Server {
             },
             close: () => conn.close(),
         };
+        Reflect.set(response as object, '__cnoTcp', conn.socket.socket);
+        return response;
     }
 
 

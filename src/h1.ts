@@ -218,8 +218,7 @@ export class H1ServerConnection implements ProtocolConnection {
     private method = ''; private url = ''; private reqHeaders: Array<[string, string]> = [];
     private headerField = ''; private headersOk = false;
     private expectBody = false; private contentLength = 0; private chunked = false;
-    private bodyRead = 0; private bodyCtrl: ((chunk: Uint8Array) => void) | null = null;
-    private bodyEnd: (() => void) | null = null;
+    private bodyRead = 0;
     private headersSent = false; private responseEnded = false; private chunkedEncoding = false;
     private compressEncoding: 'gzip' | 'deflate' | null = null;
     private compressor: StreamingCompressor | null = null;
@@ -229,16 +228,53 @@ export class H1ServerConnection implements ProtocolConnection {
     private upgradeLeftover: Uint8Array | null = null;
     private pendingInput: Uint8Array | null = null;
     private events: ProtocolConnectionEvents = { onstream: null, onError: null, onClose: null, onGoaway: null, onSettings: null };
+    private bodyChunk: Uint8Array[] = [];
+    private pendingPromise: PromiseWithResolvers<Uint8Array | null> | null = null;
+    private bodyError: Error | null = null;
+    private ended = false;
 
     constructor(socket: TcpSocket, secure: boolean) { this.socket = socket; this.secure = secure; this.parser = new http.Parser(http.REQUEST); this.setupParser(); }
 
     isClosed(): boolean { return this._closed; }
 
+    private enqueue(u8: Uint8Array) {
+        const pending = this.pendingPromise;
+        if (pending) {
+            this.pendingPromise = null;
+            pending.resolve(u8);
+        } else {
+            this.bodyChunk.push(u8);
+        }
+    }
+
+    private finishBody(): void {
+        this.ended = true;
+        const pending = this.pendingPromise;
+        if (pending) {
+            this.pendingPromise = null;
+            pending.resolve(null);
+        }
+    }
+
+    private failBody(err: Error): void {
+        this.bodyError = err;
+        this.ended = true;
+        const pending = this.pendingPromise;
+        if (pending) {
+            this.pendingPromise = null;
+            pending.reject(err);
+        }
+    }
+
     private setupParser(): void {
         const decode = (buf: any, off: number, len: number) => engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
         this.parser.onUrl = (buf, off, len) => { this.url += decode(buf, off, len); };
         this.parser.onHeaderField = (buf, off, len) => { this.headerField = decode(buf, off, len).toLowerCase(); };
-        this.parser.onHeaderValue = (buf, off, len) => { this.reqHeaders.push([this.headerField, decode(buf, off, len)]); };
+        this.parser.onHeaderValue = (buf, off, len) => {
+            this.reqHeaders.push(
+                [this.headerField.toLowerCase(), decode(buf, off, len)]
+            )
+        };
         this.parser.onHeadersComplete = () => {
             this.method = HTTP_METHODS[this.parser.state.method] ?? 'UNKNOWN'; this.headersOk = true;
             const connH = this.reqHeaders.find(([n]) => n === 'connection')?.[1]?.toLowerCase();
@@ -249,103 +285,98 @@ export class H1ServerConnection implements ProtocolConnection {
             if (ae) this.compressEncoding = pickEncoding(parseAcceptEncoding(ae));
             const cl = this.reqHeaders.find(([n]) => n === 'content-length')?.[1];
             const te = this.reqHeaders.find(([n]) => n === 'transfer-encoding')?.[1];
-            if (cl) { this.contentLength = parseInt(cl); this.expectBody = this.contentLength > 0; }
-            else if (te?.toLowerCase().includes('chunked')) { this.chunked = true; this.expectBody = true; }
-        };
-        this.parser.onBody = (buf, off, len) => { if (this.bodyCtrl) this.bodyCtrl(new Uint8Array(buf as ArrayBuffer).slice(off, off + len)); this.bodyRead += len; if (!this.chunked && this.bodyRead >= this.contentLength && this.bodyEnd) { this.bodyEnd(); this.bodyCtrl = null; this.bodyEnd = null; } };
-        this.parser.onMessageComplete = () => {
-            if (this.bodyEnd) {
-                this.bodyEnd();
-                this.bodyCtrl = null;
-                this.bodyEnd = null;
+            if (cl) {
+                this.contentLength = parseInt(cl); this.expectBody = this.contentLength > 0;
+            } else if (te?.toLowerCase().includes('chunked')) {
+                this.chunked = true; this.expectBody = true;
             }
+        };
+        this.parser.onBody = (buf, off, len) => {
+            const u8 = new Uint8Array(buf as ArrayBuffer).subarray(off, off + len);
+            this.enqueue(u8);
+        }
+        this.parser.onMessageComplete = () => {
+            this.finishBody();
             this.parser.pause();
         };
     }
 
-    async handleRequest(handler: (req: RawRequest, res: RawResponse) => void | Promise<void>): Promise<boolean> {
+    async handleRequest(handler: (req: RawRequest, res: RawResponse) => void | Promise<void>, onHeaders?: () => void): Promise<boolean> {
         this.method = ''; this.url = ''; this.reqHeaders = []; this.headerField = ''; this.headersOk = false;
         this.expectBody = false; this.contentLength = 0; this.chunked = false; this.bodyRead = 0;
         this.headersSent = false; this.responseEnded = false;
         this.chunkedEncoding = false; this.compressEncoding = null; this.compressor = null;
         this.requestHttpVersion = '1.1';
+        this.bodyChunk = [];
+        this.pendingPromise = null;
+        this.bodyError = null;
+        this.ended = false;
 
-        const pendingBodyChunks: Uint8Array[] = [];
-        let messageDone = false;
-        let requestStarted = false;
-        let bodyClosed = false;
-        let bodyController: ReadableStreamDefaultController<Uint8Array> | null = null;
-        let handlerPromise: Promise<void> | null = null;
-
-        const flushPendingBody = () => {
-            if (!bodyController) return;
-            while (pendingBodyChunks.length > 0) bodyController.enqueue(pendingBodyChunks.shift()!);
-            if (bodyClosed) {
-                bodyController.close();
-                bodyController = null;
-            }
+        const req: RawRequest = {
+            method: '', url: '', httpVersion: this.requestHttpVersion,
+            headers: this.reqHeaders, body: null
         };
-
-        this.bodyCtrl = (chunk) => {
-            if (bodyController) bodyController.enqueue(chunk);
-            else pendingBodyChunks.push(chunk);
+        Reflect.set(req as object, '__cnoTcp', this.socket.socket);
+        const res: RawResponse = {
+            status: 200, statusText: 'OK', headers: [], body: null
         };
-        this.bodyEnd = () => {
-            messageDone = true;
-            bodyClosed = true;
-            if (bodyController) {
-                bodyController.close();
-                bodyController = null;
-            }
-            this.bodyCtrl = null;
-            this.bodyEnd = null;
-        };
+        let handlePromise: Promise<any> | undefined;
+        let handlerStarted = false;
 
-        const startHandler = () => {
-            if (requestStarted || !this.headersOk) return;
-            requestStarted = true;
-            const body = this.expectBody
-                ? new ReadableStream<Uint8Array>({
-                    start: (controller) => {
-                        bodyController = controller;
-                        flushPendingBody();
-                    }
-                })
-                : null;
-            const req: RawRequest = {
-                method: this.method,
-                url: this.url,
-                httpVersion: this.requestHttpVersion,
-                headers: this.reqHeaders,
-                body,
-            };
-            const res: RawResponse = { status: 200, statusText: 'OK', headers: [], body: null };
-            handlerPromise = Promise.resolve(handler(req, res));
-        };
-
-        while (true) {
-            if (this.headersOk) {
-                startHandler();
-                if (!this.expectBody || messageDone) break;
-            }
-
+        while (!this.ended) {
             let data = this.pendingInput;
             this.pendingInput = null;
             if (data === null) data = await this.socket.read();
             if (data === null) {
                 if (!this.headersOk) return false;
-                if (this.bodyEnd) this.bodyEnd();
+                this.failBody(new Error('Connection closed'));
                 break;
             }
             if (data.length === 0) continue;
 
             const r = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
+
+            // Start the handler as soon as headers are parsed. This must run
+            // before the HPE_PAUSED break below: when the whole request arrives
+            // in one buffer, onMessageComplete pauses the parser mid-execute,
+            // so execute() returns HPE_PAUSED on the same call that produced
+            // the headers. Checking errno first would skip the handler entirely.
+            if (this.headersOk && !handlerStarted) {
+                handlerStarted = true;
+                onHeaders?.();
+                req.method = this.method;
+                req.url = this.url;
+                req.httpVersion = this.requestHttpVersion;
+                if (this.expectBody) {
+                    req.body = () => {
+                        if (this.bodyChunk.length) return Promise.resolve(this.bodyChunk.shift()!);
+                        if (this.bodyError) return Promise.reject(this.bodyError);
+                        if (this.ended) return Promise.resolve(null);
+                        const pending = Promise.withResolvers<Uint8Array | null>();
+                        this.pendingPromise = pending;
+                        return pending.promise;
+                    };
+                }
+                handlePromise = Promise.resolve(handler(req, res));
+            }
+
             if (r.errno !== 0) {
                 const consumed = Number((r as any).bytesConsumed ?? data.byteLength);
                 if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
                     this.pendingInput = data.subarray(consumed);
                 }
                 if (r.name === 'HPE_PAUSED') {
+                    // A WebSocket/upgrade handshake completes via onMessageComplete,
+                    // which pauses the parser — so execute() returns plain HPE_PAUSED
+                    // (not HPE_PAUSED_UPGRADE) even though state.upgrade is set. If we
+                    // don't capture the leftover here, any bytes the client coalesced
+                    // after the handshake (the first WS frame) are dropped, and the
+                    // upgraded WebSocket hangs waiting for a frame already consumed.
+                    if (this.parser.state.upgrade) {
+                        this.upgradeLeftover = this.pendingInput;
+                        this.pendingInput = null;
+                        this.keepAlive = false;
+                    }
                     break;
                 }
                 if (r.name === 'HPE_PAUSED_UPGRADE') {
@@ -354,24 +385,19 @@ export class H1ServerConnection implements ProtocolConnection {
                     this.keepAlive = false;
                     break;
                 }
-                if (bodyController) {
-                    const err = new Error(`Parse error: ${r.reason}`);
-                    (bodyController as ReadableStreamDefaultController<Uint8Array> & { error?: (reason?: any) => void }).error?.(err);
-                    bodyController = null;
-                }
+                this.failBody(new Error(`Parse error: ${r.reason}`));
                 throw new Error(`Parse error: ${r.reason}`);
             }
         }
 
-        this.bodyCtrl = null; this.bodyEnd = null;
-        startHandler();
-        await handlerPromise;
         this.parser.reset(http.REQUEST); this.requestCount++;
+        await handlePromise;
         return this._upgraded ? false : this.keepAlive;
     }
 
     async writeHead(status: number, statusText: string, headers: Array<[string, string]>): Promise<void> {
         if (this.headersSent) throw new Error("Headers already sent");
+        if (this.responseEnded) throw new Error("Response already ended");
         const headerValue = (name: string): string | undefined =>
             headers.find(([n]) => n.toLowerCase() === name)?.[1];
         const hasHeader = (name: string): boolean =>
@@ -431,7 +457,7 @@ export class H1ServerConnection implements ProtocolConnection {
         this.compressor = null; this.compressEncoding = null; this.responseEnded = true;
     }
 
-    receive(_d: Uint8Array): void {}
+    receive(_d: Uint8Array): void { }
     wantWrite(): boolean { return false; }
     flush(): Uint8Array | null { return null; }
     createStream(): ProtocolStream { return new H1Stream(this, true); }
@@ -472,7 +498,7 @@ class H1ClientConnection implements ProtocolConnection {
         while (!this.parser.isCompleted) { const d = await this.socket.read(); if (!d) break; this.parser.feed(d); }
         return { status, statusText: strstatus(status), headers, body: mergeChunks(chunks) };
     }
-    receive(_d: Uint8Array): void {}
+    receive(_d: Uint8Array): void { }
     wantWrite(): boolean { return false; }
     flush(): Uint8Array | null { return null; }
     createStream(): ProtocolStream { return new H1Stream(this, false); }
@@ -527,8 +553,8 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     return merged;
 }
 
-const HTTP_METHODS = ["DELETE","GET","HEAD","POST","PUT","CONNECT","OPTIONS","TRACE","COPY","LOCK","MKCOL","MOVE","PROPFIND","PROPPATCH","SEARCH","UNLOCK","BIND","REBIND","UNBIND","ACL","REPORT","MKACTIVITY","CHECKOUT","MERGE","MSEARCH","NOTIFY","SUBSCRIBE","UNSUBSCRIBE","PATCH","PURGE","MKCALENDAR","LINK","UNLINK"] as const;
-const STATUS_TEXT_MAP: Record<number, string> = { 100:'Continue',101:'Switching Protocols',200:'OK',201:'Created',204:'No Content',301:'Moved Permanently',302:'Found',304:'Not Modified',400:'Bad Request',401:'Unauthorized',403:'Forbidden',404:'Not Found',500:'Internal Server Error',502:'Bad Gateway',503:'Service Unavailable' };
+const HTTP_METHODS = ["DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE", "COPY", "LOCK", "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH", "UNLOCK", "BIND", "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY", "CHECKOUT", "MERGE", "MSEARCH", "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK"] as const;
+const STATUS_TEXT_MAP: Record<number, string> = { 100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable' };
 function strstatus(code: number): string { return STATUS_TEXT_MAP[code] ?? `Status ${code}`; }
 
 
