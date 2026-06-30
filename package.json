@@ -1,9 +1,13 @@
 ﻿{
     "name": "@cnojs/http",
     "version": "1.0.0",
-    "description": "Low-level HTTP protocol library 鈥?no WebAPI dependencies",
+    "description": "Low-level HTTP protocol library for cno server",
     "type": "module",
     "main": "src/index.ts",
+    "publishConfig": {
+        "access": "public",
+        "registry": "https://registry.npmjs.org"
+    },
     "exports": {
         ".": "./src/index.ts",
         "./socket": "./src/socket.ts",
