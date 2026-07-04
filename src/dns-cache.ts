@@ -9,6 +9,27 @@
 const dns = import.meta.use("dns");
 const os = import.meta.use("os");
 
+function isIPv4(hostname: string): boolean {
+    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return false;
+    return hostname.split('.').every((part) => {
+        const value = Number(part);
+        return Number.isInteger(value) && value >= 0 && value <= 255;
+    });
+}
+
+function isIPv6(hostname: string): boolean {
+    if (!hostname.includes(':')) return false;
+    const parts = hostname.split(':');
+    if (parts.length < 3 || parts.length > 8) return false;
+    return parts.every((part) => part === '' || /^[0-9a-fA-F]{1,4}$/.test(part));
+}
+
+function literalAddress(hostname: string): DnsAddress[] | null {
+    if (isIPv4(hostname)) return [{ ip: hostname, family: 4 }];
+    if (isIPv6(hostname)) return [{ ip: hostname, family: 6 }];
+    return null;
+}
+
 export interface DnsAddress {
     ip: string;
     family: number;
@@ -31,6 +52,9 @@ class DnsCache {
     }
 
     async resolve(hostname: string, options?: { family?: number }): Promise<DnsAddress[]> {
+        const literal = literalAddress(hostname);
+        if (literal) return literal;
+
         const key = `${hostname}:${options?.family ?? 0}`;
         const cached = this.cache.get(key);
         if (cached && Date.now() < cached.expiresAt) return cached.addresses;
@@ -45,6 +69,9 @@ class DnsCache {
     }
 
     resolveSync(hostname: string, family = 0): DnsAddress[] {
+        const literal = literalAddress(hostname);
+        if (literal) return literal;
+
         const key = `${hostname}:${family}`;
         const cached = this.cache.get(key);
         if (cached && Date.now() < cached.expiresAt) return cached.addresses;

@@ -89,6 +89,7 @@ const PROTOCOL_MODULES = new Map<HttpVersion, IProtocol>([
 export class Server {
     public readonly config: Required<ServerConfig>;
     public readonly handler: RequestHandler;
+    public onRequestError: ((error: Error, socket: TcpSocket) => void) | null = null;
 
     private listener: CModuleStreams.TCP | null = null;
     private sslContext: CModuleSSL.Context | null = null;
@@ -256,7 +257,12 @@ export class Server {
                 });
                 firstRequest = false;
             } catch (err: any) {
-                if (!TcpSocket.isDisconnectError(err) && !timedOut) console.error("Request error:", err);
+                if (!TcpSocket.isDisconnectError(err) && !timedOut) {
+                    try {
+                        if (this.onRequestError) this.onRequestError(err, conn.socket);
+                        else console.error("Request error:", err);
+                    } catch (cbErr) { console.error("onRequestError threw:", cbErr); }
+                }
                 keepAlive = false;
             } finally { if (tid !== null) timers.clearTimeout(tid); }
         }

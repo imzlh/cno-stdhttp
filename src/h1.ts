@@ -213,7 +213,7 @@ class H1Stream implements ProtocolStream {
 export class H1ServerConnection implements ProtocolConnection {
     readonly version = HttpVersion.HTTP11;
     readonly secure: boolean;
-    protected socket: TcpSocket;
+    readonly socket: TcpSocket;
     private parser: CModuleHTTP.Parser;
     private method = ''; private url = ''; private reqHeaders: Array<[string, string]> = [];
     private headerField = ''; private headersOk = false;
