@@ -29,6 +29,8 @@
  * └─────────────────────────────────────────────────────────────────┘
  */
 
+import type { TcpSocket } from "./socket";
+
 /* ------------------------------------------------------------------ */
 /* Connection-level protocol negotiation                              */
 /* ------------------------------------------------------------------ */
@@ -129,7 +131,7 @@ export interface ProtocolClientConfig {
 
 export interface ProtocolClient {
     readonly version: HttpVersion;
-    connect(socket: any, config: ProtocolClientConfig): Promise<ProtocolConnection>;
+    connect(socket: TcpSocket, config: ProtocolClientConfig): Promise<ProtocolConnection>;
     request(conn: ProtocolConnection, req: RawRequest): Promise<RawResponse>;
 }
 
@@ -149,7 +151,7 @@ export interface ProtocolServerConfig {
 
 export interface ProtocolServer {
     readonly version: HttpVersion;
-    accept(socket: any, config: ProtocolServerConfig): Promise<ProtocolConnection>;
+    accept(socket: TcpSocket, config: ProtocolServerConfig): Promise<ProtocolConnection>;
     negotiate(alpnProtocol?: string): HttpVersion | null;
 }
 

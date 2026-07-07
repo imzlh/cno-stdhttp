@@ -33,11 +33,11 @@ export interface ISocket {
  * and callback-based readable events.
  */
 export class TcpSocket implements ISocket {
-    public  socket:  CModuleStreams.TCP;
+    public  socket:  CModuleStreams.Stream;
     public  sslPipe: CModuleSSL.Pipe | null = null;
     private pending: Uint8Array | null = null;
 
-    constructor(socket?: CModuleStreams.TCP) {
+    constructor(socket?: CModuleStreams.Stream) {
         this.socket = socket ?? new streams.TCP();
     }
 
@@ -50,9 +50,12 @@ export class TcpSocket implements ISocket {
 
     private setupReadCallback(): void {
         try { this.socket.stopRead(); } catch { /* ignore */ }
-        this.socket.onread = (data: Uint8Array | null | undefined, err?: any) => {
+        this.socket.onread = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
             if (data === undefined) {
-                if (err) { this._readErrHandler?.(err as Error); this.socket.onread = null as any; }
+                if (err) {
+                    this._readErrHandler?.(err);
+                    Reflect.set(this.socket, 'onread', null);
+                }
                 return;
             }
             if (data === null) { this._readCallback?.(null); return; }
@@ -60,7 +63,7 @@ export class TcpSocket implements ISocket {
             if (this._readCallback) {
                 try {
                     this.socket.startRead();
-                } catch (e: any) {
+                } catch (e: unknown) {
                     if ((e as CModuleError.Error).code !== error.errno.EALREADY) throw e;
                 }
             }
@@ -82,8 +85,7 @@ export class TcpSocket implements ISocket {
         this.socket.stopRead();
         this._readCallback = null;
         this._readErrHandler = null;
-        // @ts-ignore
-        this.socket.onread = null;
+        Reflect.set(this.socket, 'onread', null);
     }
 
     /* -------------------------------------------------------------- */
@@ -94,7 +96,7 @@ export class TcpSocket implements ISocket {
     async read(size = READ_SIZE): Promise<Uint8Array | null> {
         if (!this.sslPipe) {
             const buf = new Uint8Array(size);
-            const n = await this.socket.read(buf);
+            const n = await this.readRaw(buf);
             return (n === 0) ? null : buf.subarray(0, n);
         }
 
@@ -109,14 +111,16 @@ export class TcpSocket implements ISocket {
 
         const buf = new Uint8Array(READ_SIZE);
         while (true) {
-            const n = await this.socket.read(buf);
+            const n = await this.readRaw(buf);
             if (n === 0) return null; // EOF
             const cipher = buf.subarray(0, n);
             const consumed = this.feedCipher(cipher);
             if (consumed < cipher.length) this.pending = cipher.subarray(consumed);
             // Drive SSL state machine (handles renegotiation), then flush any output
-            this.sslPipe!.handshake();
-            const out = this.sslPipe!.getOutput();
+            const sslPipe = this.sslPipe;
+            if (!sslPipe) return null;
+            sslPipe.handshake();
+            const out = sslPipe.getOutput();
             if (out) await this.socket.write(new Uint8Array(out));
             const plain = this.sslRead(size);
             if (plain) return plain;
@@ -148,7 +152,7 @@ export class TcpSocket implements ISocket {
         this.sslPipe = new ssl.Pipe(ctx);
         const buf = new Uint8Array(READ_SIZE);
         while (!this.sslPipe.handshakeComplete) {
-            const n = await this.socket.read(buf);
+            const n = await this.readRaw(buf);
             if (n === 0) throw new Error("SSL handshake failed: connection closed");
             let toFeed = buf.subarray(0, n);
             while (toFeed.length > 0) { const c = this.feedCipher(toFeed); if (c <= 0) break; toFeed = toFeed.subarray(c); }
@@ -167,7 +171,7 @@ export class TcpSocket implements ISocket {
 
         const buf = new Uint8Array(READ_SIZE);
         while (!this.sslPipe.handshakeComplete) {
-            const n = await this.socket.read(buf);
+            const n = await this.readRaw(buf);
             if (n === 0) throw new Error("TLS handshake failed: connection closed");
             let toFeed = buf.subarray(0, n);
             while (toFeed.length > 0) {
@@ -214,9 +218,18 @@ export class TcpSocket implements ISocket {
     /* -------------------------------------------------------------- */
 
     private feedCipher(data: Uint8Array): number {
-        const n = this.sslPipe!.feed(data);
+        const sslPipe = this.sslPipe;
+        if (!sslPipe) throw new Error('SSL pipe is not initialized');
+        const n = sslPipe.feed(data);
         if (n < 0) throw new Error(`SSL feed error: ${n}`);
         return n;
+    }
+
+    private readRaw(buf: Uint8Array): Promise<number> {
+        return this.socket.read(buf).catch((err) => {
+            if (this._closed && TcpSocket.isDisconnectError(err)) return 0;
+            throw err;
+        });
     }
 
     private feedAndRead(data: Uint8Array, size: number): Uint8Array | null {
@@ -225,7 +238,9 @@ export class TcpSocket implements ISocket {
     }
 
     private sslRead(size: number): Uint8Array | null {
-        const plain = this.sslPipe!.read(size);
+        const sslPipe = this.sslPipe;
+        if (!sslPipe) return null;
+        const plain = sslPipe.read(size);
         return (plain && plain.byteLength > 0) ? new Uint8Array(plain) : null;
     }
 

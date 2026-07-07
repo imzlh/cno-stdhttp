@@ -10,8 +10,13 @@
  */
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+type NativeTcpCarrier = { __cnoTcp?: CModuleStreams.Stream };
 
-import { TcpSocket } from "./socket";
+function isTcpStream(stream: CModuleStreams.Stream): stream is CModuleStreams.TCP {
+    return 'setNoDelay' in stream && 'setKeepAlive' in stream;
+}
+
+import { TcpSocket, type ISocket } from "./socket";
 import { h1, H1ServerConnection } from "./h1";
 import {
     type RawRequest, type RawResponse,
@@ -35,6 +40,7 @@ const timers = import.meta.use('timers');
 export interface ServerConfig {
     hostname?: string;
     port: number;
+    path?: string;
     cert?: string;
     key?: string;
     keepAliveTimeout?: number;
@@ -60,8 +66,14 @@ export interface HttpResponse {
     writeHead(status: number, statusText?: string, headers?: Array<[string, string]>): Promise<void>;
     write(chunk: Uint8Array | string): Promise<void>;
     end(chunk?: Uint8Array | string): Promise<void>;
-    upgrade(): any;
+    upgrade(): UpgradedConnection;
     close(): void;
+}
+
+export interface UpgradedConnection extends ISocket {
+    socket: TcpSocket;
+    sslPipe: CModuleSSL.Pipe | null;
+    isClosed(): boolean;
 }
 
 interface IProtocol {
@@ -91,7 +103,7 @@ export class Server {
     public readonly handler: RequestHandler;
     public onRequestError: ((error: Error, socket: TcpSocket) => void) | null = null;
 
-    private listener: CModuleStreams.TCP | null = null;
+    private listener: CModuleStreams.TCP | CModuleStreams.Pipe | null = null;
     private sslContext: CModuleSSL.Context | null = null;
     private connections = new Set<ProtocolConnection>();
     private listening = false;
@@ -111,6 +123,7 @@ export class Server {
         this.config = {
             hostname: config.hostname ?? "0.0.0.0",
             port: config.port,
+            path: config.path ?? "",
             cert: config.cert ?? "",
             key: config.key ?? "",
             keepAliveTimeout: config.keepAliveTimeout ?? 60000,
@@ -125,26 +138,40 @@ export class Server {
         if (this.config.cert && this.config.key) {
             this.sslContext = new ssl.Context({ mode: "server", cert: this.config.cert, key: this.config.key });
         }
-        const family = this.config.hostname.includes(':') ? os.AF_INET6 : os.AF_INET;
-        this.listener = new streams.TCP(family);
-        this.listener.bind({ ip: this.config.hostname, port: this.config.port });
+        if (this.config.path) {
+            this.listener = new streams.Pipe();
+            this.listener.bind(this.config.path);
+        } else {
+            const family = this.config.hostname.includes(':') ? os.AF_INET6 : os.AF_INET;
+            this.listener = new streams.TCP(family);
+            this.listener.bind({ ip: this.config.hostname, port: this.config.port });
+        }
         this.listener.listen(511);
         // Update config with the actual bound port (OS-assigned when port was 0)
-        const sn = this.listener.sockname;
-        if (sn) this.config.port = sn.port;
+        if (!this.config.path) {
+            const sn = (this.listener as CModuleStreams.TCP).sockname;
+            if (sn) this.config.port = sn.port;
+        }
         this.listening = true;
     }
 
     async acceptLoop(): Promise<void> {
         assert(this.listener, "Server not listening");
+        const listener = this.listener;
         const proto = this.sslContext ? "https" : "http";
         console.debug(`Server listening on ${proto}://${this.config.hostname}:${this.config.port}`);
 
-        this.listener!.onconnection = (error: any, client: any) => {
-            if (error) return console.error("Accept error:", error);
+        listener.onconnection = (error: CModuleError.Error | undefined, client: CModuleStreams.Stream | undefined) => {
+            if (error) {
+                if (!this.listening || TcpSocket.isDisconnectError(error)) return;
+                return console.error("Accept error:", error);
+            }
+            if (!client) return;
             if (this.draining) { client.close(); return; }
-            client.setNoDelay(true);
-            client.setKeepAlive(true, 1000);
+            if (isTcpStream(client)) {
+                client.setNoDelay(true);
+                client.setKeepAlive(true, 1000);
+            }
             const tcpSocket = new TcpSocket(client);
             this.handleConnection(tcpSocket).catch((e: Error) => {
                 if (!TcpSocket.isDisconnectError(e)) console.error("Connection error:", e);
@@ -171,7 +198,11 @@ export class Server {
         return drainPromise;
     }
 
-    address(): { ip: string; port: number } | null { return this.listener?.sockname ?? null; }
+    address(): { ip: string; port: number } | { path: string } | null {
+        if (!this.listener) return null;
+        if (this.config.path) return { path: (this.listener as CModuleStreams.Pipe).getsockname() };
+        return (this.listener as CModuleStreams.TCP).sockname;
+    }
 
     /* -------------------------------------------------------------- */
     /* Per-connection handler                                          */
@@ -206,7 +237,8 @@ export class Server {
             requestTimeout: this.config.requestTimeout,
         };
 
-        const protoModule = PROTOCOL_MODULES.get(version)!;
+        const protoModule = PROTOCOL_MODULES.get(version);
+        if (!protoModule) throw new Error(`Unsupported HTTP protocol version: ${version}`);
         const protoConn = await protoModule.server.accept(socket, protoConfig);
         this.connections.add(protoConn);
 
@@ -240,10 +272,13 @@ export class Server {
     private async h1RequestLoop(conn: H1ServerConnection): Promise<void> {
         let keepAlive = true;
         let firstRequest = true;
+        let requestCount = 0;
         while (keepAlive && !conn.isClosed()) {
             const timeoutMs = firstRequest ? this.config.requestTimeout : this.config.keepAliveTimeout;
             let timedOut = false;
-            let tid: any = timers.setTimeout(() => { timedOut = true; conn.close(); }, timeoutMs);
+            let tid: number | null = timeoutMs > 0
+                ? timers.setTimeout(() => { timedOut = true; conn.close(); }, timeoutMs)
+                : null;
             try {
                 keepAlive = await conn.handleRequest(async (req: RawRequest, _res: RawResponse) => {
                     const httpReq = this.toHttpRequest(req);
@@ -256,11 +291,14 @@ export class Server {
                     if (tid !== null) { timers.clearTimeout(tid); tid = null; }
                 });
                 firstRequest = false;
-            } catch (err: any) {
+                requestCount++;
+                if (requestCount >= this.config.maxRequestsPerConnection) keepAlive = false;
+            } catch (err) {
                 if (!TcpSocket.isDisconnectError(err) && !timedOut) {
+                    const error = err instanceof Error ? err : new Error(String(err));
                     try {
-                        if (this.onRequestError) this.onRequestError(err, conn.socket);
-                        else console.error("Request error:", err);
+                        if (this.onRequestError) this.onRequestError(error, conn.socket);
+                        else console.error("Request error:", error);
                     } catch (cbErr) { console.error("onRequestError threw:", cbErr); }
                 }
                 keepAlive = false;
@@ -277,11 +315,11 @@ export class Server {
             method: raw.method, url: raw.url, httpVersion: raw.httpVersion,
             headers: raw.headers, body: raw.body as StreamPoll | null,
         };
-        Reflect.set(request as object, '__cnoTcp', (raw as any).__cnoTcp);
+        Reflect.set(request as object, '__cnoTcp', (raw as RawRequest & NativeTcpCarrier).__cnoTcp);
         return request;
     }
 
-    private toHttpResponse(conn: any): HttpResponse {
+    private toHttpResponse(conn: H1ServerConnection): HttpResponse {
         let headersSent = false;
         const response = {
             status: 200, statusText: 'OK', headers: [] as Array<[string, string]>,
@@ -313,6 +351,9 @@ export class Server {
                         if (pending && pending.byteLength > 0) { const data = pending; pending = null; cb(data); }
                     },
                     stopReading: () => conn.socket.stopReading(),
+                    serverHandshake: (ctx: CModuleSSL.Context) => conn.socket.serverHandshake(ctx),
+                    clientHandshake: (ctx: CModuleSSL.Context, servername?: string) => conn.socket.clientHandshake(ctx, servername),
+                    get alpnProtocol() { return conn.socket.alpnProtocol; },
                     close: () => conn.close(),
                     isClosed: () => conn.isClosed(),
                 };

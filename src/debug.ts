@@ -39,7 +39,7 @@ export function isDebugEnabled(category: string): boolean {
     return _enabled.has('*') || _enabled.has(category) || (parent !== null && _enabled.has(parent));
 }
 
-export function dbg(category: string, msg: string | (() => string), ...rest: any[]): void {
+export function dbg(category: string, msg: string | (() => string), ...rest: unknown[]): void {
     if (!isDebugEnabled(category)) return;
     const text = typeof msg === 'function' ? msg() : msg;
     console.log(`\x1b[2m[${category}]\x1b[0m ${text}`, ...rest);
@@ -93,7 +93,8 @@ export function hexDump(
             if (count == 256) { console.log('...'); break loop; }
 
             if (i + j < len) {
-                const byte = bytes[i + j]!;
+                const byte = bytes[i + j];
+                if (byte === undefined) continue;
                 hexParts.push(color('hex', byte.toString(16).padStart(2, '0')));
                 if (showAscii) {
                     asciiParts.push(byte >= 32 && byte <= 126

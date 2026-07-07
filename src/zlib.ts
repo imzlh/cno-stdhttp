@@ -13,7 +13,18 @@ export function parseAcceptEncoding(header: string | null | undefined): ('gzip' 
     const result: ('gzip' | 'deflate')[] = [];
     const parts = header.toLowerCase().split(',').map(s => s.trim());
     for (const part of parts) {
-        const algo = part.split(';')[0]!.trim();
+        const tokens = part.split(';').map(s => s.trim());
+        const algo = tokens[0];
+        if (algo === undefined) continue;
+        let q = 1;
+        for (const token of tokens.slice(1)) {
+            const [name, value] = token.split('=').map(s => s.trim());
+            if (name === 'q' && value !== undefined) {
+                const parsed = Number(value);
+                if (Number.isFinite(parsed)) q = parsed;
+            }
+        }
+        if (q <= 0) continue;
         if (algo === 'gzip' && !result.includes('gzip')) result.push('gzip');
         else if (algo === 'deflate' && !result.includes('deflate')) result.push('deflate');
     }
@@ -30,7 +41,7 @@ export function pickEncoding(supported: ('gzip' | 'deflate')[]): 'gzip' | 'defla
 /** Check if Content-Type is worth compressing. */
 export function shouldCompress(contentType: string | null): boolean {
     if (!contentType) return false;
-    const ct = contentType.toLowerCase().split(';')[0]!.trim();
+    const ct = contentType.toLowerCase().split(';')[0]?.trim() ?? '';
     return ct.startsWith('text/') || ct === 'application/json' || ct === 'application/javascript' ||
            ct === 'application/xml' || ct === 'application/xhtml+xml' || ct === 'application/rss+xml' ||
            ct === 'application/atom+xml' || ct === 'application/svg+xml' || ct === 'application/wasm' ||

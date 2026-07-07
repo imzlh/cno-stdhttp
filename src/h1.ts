@@ -29,6 +29,15 @@ import { assert } from "../utils/assert";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
+function toByteView(buf: CModuleHTTP.BufferSource): Uint8Array {
+    if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
+    return new Uint8Array(new globalThis.Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+}
+
+function decodeParserBytes(buf: CModuleHTTP.BufferSource, off: number, len: number): string {
+    return engine.decodeString(toByteView(buf).slice(off, off + len));
+}
+
 /* ------------------------------------------------------------------ */
 /* HTTP/1.x Request Builder (low-level: strings + bytes, no URL/Headers) */
 /* ------------------------------------------------------------------ */
@@ -124,11 +133,9 @@ export class HttpResponseParser {
     constructor() { this.parser = new http.Parser(http.RESPONSE); this.setupCallbacks(); }
 
     private setupCallbacks(): void {
-        const decode = (buf: any, off: number, len: number) =>
-            engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
-        this.parser.onStatus = (buf, off, len) => { this.statusText = decode(buf, off, len); };
-        this.parser.onHeaderField = (buf, off, len) => { this.currentHeaderField = decode(buf, off, len).toLowerCase(); };
-        this.parser.onHeaderValue = (buf, off, len) => { this.headers.push([this.currentHeaderField, decode(buf, off, len)]); this.currentHeaderField = ''; };
+        this.parser.onStatus = (buf, off, len) => { this.statusText = decodeParserBytes(buf, off, len); };
+        this.parser.onHeaderField = (buf, off, len) => { this.currentHeaderField = decodeParserBytes(buf, off, len).toLowerCase(); };
+        this.parser.onHeaderValue = (buf, off, len) => { this.headers.push([this.currentHeaderField, decodeParserBytes(buf, off, len)]); this.currentHeaderField = ''; };
         this.parser.onHeadersComplete = () => {
             this.statusCode = this.parser.state.status; this.headersComplete = true;
             if (!this.statusText) this.statusText = strstatus(this.statusCode);
@@ -140,7 +147,7 @@ export class HttpResponseParser {
             this.onHeadersComplete?.(this.statusCode, this.headers);
         };
         this.parser.onBody = (buf, off, len) => {
-            let view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            let view = toByteView(buf).slice(off, off + len);
             if (this.decompressor?.isActive) view = this.decompressor.decompress(view);
             if (!this.onData) this.bodyChunks.push(view);
             this.onData?.(view);
@@ -148,7 +155,7 @@ export class HttpResponseParser {
         this.parser.onMessageComplete = () => { this.completed = true; this.onComplete?.(); };
     }
 
-    feed(data: Uint8Array): any {
+    feed(data: Uint8Array): CModuleHTTP.ParserExecuteResult | undefined {
         try {
             const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.length + data.byteOffset));
             if (result.errno !== 0) {
@@ -267,12 +274,11 @@ export class H1ServerConnection implements ProtocolConnection {
     }
 
     private setupParser(): void {
-        const decode = (buf: any, off: number, len: number) => engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
-        this.parser.onUrl = (buf, off, len) => { this.url += decode(buf, off, len); };
-        this.parser.onHeaderField = (buf, off, len) => { this.headerField = decode(buf, off, len).toLowerCase(); };
+        this.parser.onUrl = (buf, off, len) => { this.url += decodeParserBytes(buf, off, len); };
+        this.parser.onHeaderField = (buf, off, len) => { this.headerField = decodeParserBytes(buf, off, len).toLowerCase(); };
         this.parser.onHeaderValue = (buf, off, len) => {
             this.reqHeaders.push(
-                [this.headerField.toLowerCase(), decode(buf, off, len)]
+                [this.headerField.toLowerCase(), decodeParserBytes(buf, off, len)]
             )
         };
         this.parser.onHeadersComplete = () => {
@@ -292,7 +298,7 @@ export class H1ServerConnection implements ProtocolConnection {
             }
         };
         this.parser.onBody = (buf, off, len) => {
-            const u8 = new Uint8Array(buf as ArrayBuffer).subarray(off, off + len);
+            const u8 = toByteView(buf).subarray(off, off + len);
             this.enqueue(u8);
         }
         this.parser.onMessageComplete = () => {
@@ -320,7 +326,7 @@ export class H1ServerConnection implements ProtocolConnection {
         const res: RawResponse = {
             status: 200, statusText: 'OK', headers: [], body: null
         };
-        let handlePromise: Promise<any> | undefined;
+        let handlePromise: Promise<void> | undefined;
         let handlerStarted = false;
 
         while (!this.ended) {
@@ -349,7 +355,10 @@ export class H1ServerConnection implements ProtocolConnection {
                 req.httpVersion = this.requestHttpVersion;
                 if (this.expectBody) {
                     req.body = () => {
-                        if (this.bodyChunk.length) return Promise.resolve(this.bodyChunk.shift()!);
+                        if (this.bodyChunk.length) {
+                            const chunk = this.bodyChunk.shift();
+                            if (chunk !== undefined) return Promise.resolve(chunk);
+                        }
                         if (this.bodyError) return Promise.reject(this.bodyError);
                         if (this.ended) return Promise.resolve(null);
                         const pending = Promise.withResolvers<Uint8Array | null>();
@@ -361,7 +370,7 @@ export class H1ServerConnection implements ProtocolConnection {
             }
 
             if (r.errno !== 0) {
-                const consumed = Number((r as any).bytesConsumed ?? data.byteLength);
+                const consumed = Number(r.bytesConsumed ?? data.byteLength);
                 if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
                     this.pendingInput = data.subarray(consumed);
                 }
@@ -546,7 +555,8 @@ export const h1 = { version: HttpVersion.HTTP11, client: new H1Client(), server:
 
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     if (chunks.length === 0) return new Uint8Array(0);
-    if (chunks.length === 1) return chunks[0]!;
+    const first = chunks[0];
+    if (chunks.length === 1 && first !== undefined) return first;
     const total = chunks.reduce((s, c) => s + c.length, 0);
     const merged = new Uint8Array(total); let off = 0;
     for (const c of chunks) { merged.set(c, off); off += c.length; }
@@ -556,5 +566,3 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
 const HTTP_METHODS = ["DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE", "COPY", "LOCK", "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH", "UNLOCK", "BIND", "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY", "CHECKOUT", "MERGE", "MSEARCH", "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK"] as const;
 const STATUS_TEXT_MAP: Record<number, string> = { 100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable' };
 function strstatus(code: number): string { return STATUS_TEXT_MAP[code] ?? `Status ${code}`; }
-
-
