@@ -1,5 +1,5 @@
 /**
- * HTTP/1.x protocol implementation 闁?low-level, no WebAPI dependencies.
+ * HTTP/1.x protocol implementation —low-level, no WebAPI dependencies.
  *
  * Handles:
  * - Request building (from raw strings/bytes, no URL/Headers types)
