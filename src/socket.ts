@@ -27,17 +27,27 @@ export interface ISocket {
     close(): void;
 }
 
+/** Minimal byte transport required by TcpSocket. Native streams and layered transports implement this. */
+export interface SocketTransport {
+    onread: CModuleStreams.Stream['onread'];
+    startRead(): void;
+    stopRead(): void;
+    read(buffer: CModuleStreams.BufferSource): Promise<number>;
+    write(buffer: CModuleStreams.BufferSource): Promise<number>;
+    close(): void;
+}
+
 /**
  * Base TCP socket with optional TLS.
  * Provides plaintext and SSL read/write, TLS handshake (both sides),
  * and callback-based readable events.
  */
 export class TcpSocket implements ISocket {
-    public  socket:  CModuleStreams.Stream;
+    public  socket:  SocketTransport;
     public  sslPipe: CModuleSSL.Pipe | null = null;
     private pending: Uint8Array | null = null;
 
-    constructor(socket?: CModuleStreams.Stream) {
+    constructor(socket?: SocketTransport) {
         this.socket = socket ?? new streams.TCP();
     }
 
