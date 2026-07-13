@@ -69,7 +69,35 @@ export class TcpSocket implements ISocket {
                 return;
             }
             if (data === null) { this._readCallback?.(null); return; }
-            this._readCallback?.(data);
+            // TLS: decrypt cipher before delivering (same path as read()).
+            if (this.sslPipe) {
+                try {
+                    let cipher = data;
+                    if (this.pending) {
+                        const joined = new Uint8Array(this.pending.length + cipher.length);
+                        joined.set(this.pending);
+                        joined.set(cipher, this.pending.length);
+                        cipher = joined;
+                        this.pending = null;
+                    }
+                    const consumed = this.feedCipher(cipher);
+                    if (consumed < cipher.length) this.pending = cipher.subarray(consumed);
+                    this.sslPipe.handshake();
+                    const out = this.sslPipe.getOutput();
+                    if (out) void this.socket.write(new Uint8Array(out));
+                    // Flush all available plaintext to the callback.
+                    while (this._readCallback) {
+                        const plain = this.sslRead(READ_SIZE);
+                        if (!plain) break;
+                        this._readCallback(plain);
+                    }
+                } catch (e) {
+                    this._readErrHandler?.(e instanceof Error ? e : new Error(String(e)));
+                    return;
+                }
+            } else {
+                this._readCallback?.(data);
+            }
             if (this._readCallback) {
                 try {
                     this.socket.startRead();
