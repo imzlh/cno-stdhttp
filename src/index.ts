@@ -33,6 +33,23 @@ export type { RawRequest, RawResponse, RawHeaders, ProtocolStream, ProtocolConne
 export { HttpRequestBuilder, HttpResponseParser, h1 } from "./h1";
 export type { H1RequestOptions } from "./h1";
 
+// HTTP/2 (requires native ext-h2 / CNO_EMBED_EXT_H2)
+export { h2, H2Connection } from "./h2";
+export type { H2Stream, H2Header, H2Settings } from "./h2";
+export { tryLoadH2, requireH2, h2Available, __forceH2Unavailable } from "./h2-native";
+export {
+    formatHead,
+    encodeHead,
+    encodeResponseHead,
+    encodeRequestHead,
+    formatRequestHead,
+    encodeChunkedFrame,
+    encodeChunkedTrailer,
+    connectionTokens,
+    wantsKeepAlive,
+    shouldCloseAfterResponse,
+} from "./h1-frame";
+
 // Server
 export { Server, createServer } from "./server";
 export type { ServerConfig, HttpRequest, HttpResponse, RequestHandler } from "./server";

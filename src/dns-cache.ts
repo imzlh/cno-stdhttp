@@ -61,7 +61,7 @@ class DnsCache {
         const addrs = await dns.resolve(hostname, {
             family: options?.family == 4 ? os.AF_INET : options?.family == 6 ? os.AF_INET6 : os.AF_UNSPEC
         });
-        if (!addrs?.length) return addrs;
+        if (!addrs?.length) return addrs ?? [];
         const ttl = this.inferTtl(addrs);
         this.evictIfFull(key);
         this.cache.set(key, { addresses: addrs, expiresAt: Date.now() + ttl });
@@ -77,7 +77,7 @@ class DnsCache {
         if (cached && Date.now() < cached.expiresAt) return cached.addresses;
         // Use sync DNS resolution if available, otherwise return empty
         const addrs = dns.resolveSync?.(hostname, { family }) ?? [];
-        if (!addrs?.length) return addrs;
+        if (!addrs?.length) return addrs ?? [];
         const ttl = this.inferTtl(addrs);
         this.evictIfFull(key);
         this.cache.set(key, { addresses: addrs, expiresAt: Date.now() + ttl });

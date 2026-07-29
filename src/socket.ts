@@ -15,6 +15,7 @@ const error = import.meta.use("error");
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 const READ_SIZE = 16384;
+const MAX_WRITE_STALLS = 16;
 
 export interface ISocket {
     onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
@@ -98,19 +99,8 @@ export class TcpSocket implements ISocket {
             } else {
                 this._readCallback?.(data);
             }
-            if (this._readCallback) {
-                try {
-                    this.socket.startRead();
-                } catch (e: unknown) {
-                    if ((e as CModuleError.Error).code !== error.errno.EALREADY) throw e;
-                }
-            }
         };
-        try {
-            this.socket.startRead();
-        } catch (e) {
-            if ((e as CModuleError.Error).code !== error.errno.EALREADY) throw e;
-        }
+        this.socket.startRead();
     }
 
     onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void {
@@ -143,7 +133,6 @@ export class TcpSocket implements ISocket {
 
         if (this.pending) {
             const plain = this.feedAndRead(this.pending, size);
-            this.pending = null;
             if (plain) return plain;
         }
 
@@ -172,13 +161,20 @@ export class TcpSocket implements ISocket {
         if (!this.sslPipe) { await this.socket.write(data); return; }
 
         let offset = 0;
+        let stalls = 0;
         while (offset < data.length) {
             const written = this.sslPipe.write(data.subarray(offset));
             if (written < 0) throw new Error(`SSL_write failed: ${written}`);
+            if (written === 0) {
+                // SSL must flush output or consume input before accepting more plaintext.
+                if (++stalls > MAX_WRITE_STALLS) throw new Error(`SSL_write failed: no progress after ${stalls} attempts`);
+                if (!await this.flushOutput()) await this.pumpInput();
+                continue;
+            }
+            stalls = 0;
             offset += written;
         }
-        const encrypted = this.sslPipe.getOutput();
-        if (encrypted) await this.socket.write(new Uint8Array(encrypted));
+        await this.flushOutput();
     }
 
     /* -------------------------------------------------------------- */
@@ -193,7 +189,11 @@ export class TcpSocket implements ISocket {
             const n = await this.readRaw(buf);
             if (n === 0) throw new Error("SSL handshake failed: connection closed");
             let toFeed = buf.subarray(0, n);
-            while (toFeed.length > 0) { const c = this.feedCipher(toFeed); if (c <= 0) break; toFeed = toFeed.subarray(c); }
+            while (toFeed.length > 0) {
+                const c = this.feedCipher(toFeed);
+                if (c <= 0) throw new Error(`SSL feed failed during handshake: consumed=${c}`);
+                toFeed = c < toFeed.length ? toFeed.subarray(c) : new Uint8Array(0);
+            }
             this.sslPipe.handshake();
             const out = this.sslPipe.getOutput();
             if (out) await this.socket.write(new Uint8Array(out));
@@ -271,8 +271,36 @@ export class TcpSocket implements ISocket {
     }
 
     private feedAndRead(data: Uint8Array, size: number): Uint8Array | null {
-        this.feedCipher(data);
+        const consumed = this.feedCipher(data);
+        // Re-stash any leftover cipher so a partial TLS record is not dropped.
+        this.pending = consumed < data.length ? data.subarray(consumed) : null;
         return this.sslRead(size);
+    }
+
+    /** Drain outgoing cipher to the socket. Returns true if anything was written. */
+    private async flushOutput(): Promise<boolean> {
+        const out = this.sslPipe?.getOutput();
+        if (!out || out.byteLength === 0) return false;
+        await this.socket.write(new Uint8Array(out));
+        return true;
+    }
+
+    /** Feed one raw read into the SSL engine to unblock a stalled write. */
+    private async pumpInput(): Promise<void> {
+        const buf = new Uint8Array(READ_SIZE);
+        const n = await this.readRaw(buf);
+        if (n === 0) throw new Error('SSL_write failed: connection closed');
+        let cipher = buf.subarray(0, n);
+        if (this.pending) {
+            const joined = new Uint8Array(this.pending.length + cipher.length);
+            joined.set(this.pending);
+            joined.set(cipher, this.pending.length);
+            cipher = joined;
+        }
+        const consumed = this.feedCipher(cipher);
+        this.pending = consumed < cipher.length ? cipher.subarray(consumed) : null;
+        this.sslPipe?.handshake();
+        await this.flushOutput();
     }
 
     private sslRead(size: number): Uint8Array | null {
@@ -282,10 +310,21 @@ export class TcpSocket implements ISocket {
         return (plain && plain.byteLength > 0) ? new Uint8Array(plain) : null;
     }
 
+    /** Peer/socket gone — structured `.code` only (UV number or Node string). */
     static isDisconnectError(err: unknown): boolean {
         if (!(err instanceof Error)) return false;
-        const code = (err as CModuleError.Error).code;
-        return code === error.errno.ECONNRESET || code === error.errno.EPIPE ||
-               code === error.errno.EBADF || code === error.errno.ECANCELED;
+        const code = Reflect.get(err, 'code');
+        if (typeof code === 'number') {
+            return code === error.errno.ECONNRESET || code === error.errno.EPIPE ||
+                code === error.errno.EBADF || code === error.errno.ECANCELED ||
+                code === error.errno.ECONNABORTED || code === error.errno.ESHUTDOWN ||
+                code === error.errno.ENOTCONN || code === error.errno.EOF;
+        }
+        if (typeof code === 'string') {
+            return code === 'ECONNRESET' || code === 'EPIPE' || code === 'EBADF' ||
+                code === 'ECANCELED' || code === 'ECONNABORTED' || code === 'ESHUTDOWN' ||
+                code === 'ENOTCONN' || code === 'EOF';
+        }
+        return false;
     }
 }

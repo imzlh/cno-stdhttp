@@ -15,6 +15,7 @@
 
 const http = import.meta.use("http");
 const engine = import.meta.use("engine");
+const error = import.meta.use("error");
 
 import { TcpSocket } from "./socket";
 import {
@@ -25,6 +26,13 @@ import {
     HttpVersion, ALPN,
 } from "./protocol";
 import { StreamingDecompressor, StreamingCompressor, parseAcceptEncoding, pickEncoding, shouldCompress } from "./zlib";
+import {
+    encodeResponseHead,
+    encodeRequestHead,
+    encodeChunkedFrame,
+    encodeChunkedTrailer,
+    wantsKeepAlive,
+} from "./h1-frame";
 import { assert } from "../utils/assert";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -88,15 +96,20 @@ export class HttpRequestBuilder {
         for (const [k, v] of HttpRequestBuilder.DEFAULT_HEADERS) {
             if (!this.headers.find(([n]) => n === k)) this.headers.push([k, v]);
         }
-        if (!this.headers.find(([n]) => n === 'connection'))
-            this.setHeader('connection', this.httpVersion === '1.0' ? 'close' : 'keep-alive');
+        if (!this.headers.find(([n]) => n === 'connection')) {
+            this.setHeader(
+                'connection',
+                wantsKeepAlive(this.httpVersion, null) ? 'keep-alive' : 'close',
+            );
+        }
 
         const path = this.useFullUrl ?? this.path;
-        let request = `${this.method} ${path} HTTP/${this.httpVersion}\r\n`;
-        for (const [k, v] of this.headers) { if (k && v) request += `${k}: ${v}\r\n`; }
-        request += '\r\n';
-
-        const headerBytes = engine.encodeString(request);
+        const headerBytes = encodeRequestHead(
+            this.method,
+            path,
+            this.httpVersion,
+            this.headers.filter(([k, v]) => Boolean(k && v)),
+        );
         if (this.body) {
             const combined = new Uint8Array(headerBytes.length + this.body.length);
             combined.set(headerBytes, 0); combined.set(this.body, headerBytes.length);
@@ -204,8 +217,12 @@ class H1Stream implements ProtocolStream {
             await (this.conn as H1ClientConnection).writeRequest(builder.build());
         }
     }
-    async writeData(data: Uint8Array): Promise<void> { if (this.isServer) (this.conn as H1ServerConnection).writeData(data); }
-    async end(data?: Uint8Array): Promise<void> { if (this.isServer) (this.conn as H1ServerConnection).endResponse(data); }
+    async writeData(data: Uint8Array): Promise<void> {
+        if (this.isServer) await (this.conn as H1ServerConnection).writeData(data);
+    }
+    async end(data?: Uint8Array): Promise<void> {
+        if (this.isServer) await (this.conn as H1ServerConnection).endResponse(data);
+    }
     async readMessage(): Promise<RawRequest | RawResponse> {
         return this.isServer ? (this.conn as H1ServerConnection).readRequest() : (this.conn as H1ClientConnection).readResponse();
     }
@@ -221,12 +238,16 @@ export class H1ServerConnection implements ProtocolConnection {
     readonly version = HttpVersion.HTTP11;
     readonly secure: boolean;
     readonly socket: TcpSocket;
+    /** Idle keep-alive timeout (ms); Node emits Keep-Alive: timeout=<sec> from this. */
+    private keepAliveTimeoutMs: number;
     private parser: CModuleHTTP.Parser;
     private method = ''; private url = ''; private reqHeaders: Array<[string, string]> = [];
     private headerField = ''; private headersOk = false;
     private expectBody = false; private contentLength = 0; private chunked = false;
     private bodyRead = 0;
     private headersSent = false; private responseEnded = false; private chunkedEncoding = false;
+    /** Response has explicit framing (chunked, content-length, or bodyless status/HEAD). */
+    private responseFramed = false;
     private compressEncoding: 'gzip' | 'deflate' | null = null;
     private compressor: StreamingCompressor | null = null;
     private requestCount = 0; private keepAlive = true; private requestHttpVersion = '1.1';
@@ -238,11 +259,32 @@ export class H1ServerConnection implements ProtocolConnection {
     private bodyChunk: Uint8Array[] = [];
     private pendingPromise: PromiseWithResolvers<Uint8Array | null> | null = null;
     private bodyError: Error | null = null;
+    /** Peer/transport fault observed on read — writers must see the same coded error. */
+    private transportError: Error | null = null;
     private ended = false;
 
-    constructor(socket: TcpSocket, secure: boolean) { this.socket = socket; this.secure = secure; this.parser = new http.Parser(http.REQUEST); this.setupParser(); }
+    constructor(socket: TcpSocket, secure: boolean, keepAliveTimeoutMs = 5000) {
+        this.socket = socket;
+        this.secure = secure;
+        this.keepAliveTimeoutMs = keepAliveTimeoutMs;
+        this.parser = new http.Parser(http.REQUEST);
+        this.setupParser();
+    }
 
     isClosed(): boolean { return this._closed; }
+
+    private peerClosedError(): Error {
+        return error.Error(error.errno.EOF);
+    }
+
+    private markTransportError(err: Error): void {
+        if (!this.transportError) this.transportError = err;
+    }
+
+    private throwIfTransportDead(): void {
+        if (this._closed) throw this.transportError ?? this.peerClosedError();
+        if (this.transportError) throw this.transportError;
+    }
 
     private enqueue(u8: Uint8Array) {
         const pending = this.pendingPromise;
@@ -264,6 +306,13 @@ export class H1ServerConnection implements ProtocolConnection {
     }
 
     private failBody(err: Error): void {
+        this.markTransportError(err);
+        // Peer gone: end the body stream (resolve null). Rejecting would race the
+        // pump and surface as unhandled rejection when no body consumer is attached.
+        if (TcpSocket.isDisconnectError(err)) {
+            this.finishBody();
+            return;
+        }
         this.bodyError = err;
         this.ended = true;
         const pending = this.pendingPromise;
@@ -283,10 +332,10 @@ export class H1ServerConnection implements ProtocolConnection {
         };
         this.parser.onHeadersComplete = () => {
             this.method = HTTP_METHODS[this.parser.state.method] ?? 'UNKNOWN'; this.headersOk = true;
-            const connH = this.reqHeaders.find(([n]) => n === 'connection')?.[1]?.toLowerCase();
+            const connH = this.reqHeaders.find(([n]) => n === 'connection')?.[1];
             const ver = `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`;
             this.requestHttpVersion = ver;
-            this.keepAlive = ver === '1.1' ? connH !== 'close' : connH === 'keep-alive';
+            this.keepAlive = wantsKeepAlive(ver, connH);
             const ae = this.reqHeaders.find(([n]) => n === 'accept-encoding')?.[1];
             if (ae) this.compressEncoding = pickEncoding(parseAcceptEncoding(ae));
             const cl = this.reqHeaders.find(([n]) => n === 'content-length')?.[1];
@@ -310,12 +359,13 @@ export class H1ServerConnection implements ProtocolConnection {
     async handleRequest(handler: (req: RawRequest, res: RawResponse) => void | Promise<void>, onHeaders?: () => void): Promise<boolean> {
         this.method = ''; this.url = ''; this.reqHeaders = []; this.headerField = ''; this.headersOk = false;
         this.expectBody = false; this.contentLength = 0; this.chunked = false; this.bodyRead = 0;
-        this.headersSent = false; this.responseEnded = false;
+        this.headersSent = false; this.responseEnded = false; this.responseFramed = false;
         this.chunkedEncoding = false; this.compressEncoding = null; this.compressor = null;
         this.requestHttpVersion = '1.1';
         this.bodyChunk = [];
         this.pendingPromise = null;
         this.bodyError = null;
+        this.transportError = null;
         this.ended = false;
 
         const req: RawRequest = {
@@ -332,10 +382,25 @@ export class H1ServerConnection implements ProtocolConnection {
         while (!this.ended) {
             let data = this.pendingInput;
             this.pendingInput = null;
-            if (data === null) data = await this.socket.read();
             if (data === null) {
+                try {
+                    data = await this.socket.read();
+                } catch (err) {
+                    // UV peer-gone on read — same coded path as clean EOF.
+                    const e = err instanceof Error ? err : new Error(String(err));
+                    if (!this.headersOk) {
+                        this.markTransportError(e);
+                        if (TcpSocket.isDisconnectError(e)) return false;
+                        throw e;
+                    }
+                    this.failBody(e);
+                    break;
+                }
+            }
+            if (data === null) {
+                // Clean TCP EOF: n===0 → null. Always structured IOError, never bare message.
                 if (!this.headersOk) return false;
-                this.failBody(new Error('Connection closed'));
+                this.failBody(this.peerClosedError());
                 break;
             }
             if (data.length === 0) continue;
@@ -401,10 +466,13 @@ export class H1ServerConnection implements ProtocolConnection {
 
         this.parser.reset(http.REQUEST); this.requestCount++;
         await handlePromise;
+        // Peer/transport fault ends the connection — do not wait for another request.
+        if (this.transportError || this._closed) return false;
         return this._upgraded ? false : this.keepAlive;
     }
 
     async writeHead(status: number, statusText: string, headers: Array<[string, string]>): Promise<void> {
+        this.throwIfTransportDead();
         if (this.headersSent) throw new Error("Headers already sent");
         if (this.responseEnded) throw new Error("Response already ended");
         const headerValue = (name: string): string | undefined =>
@@ -433,36 +501,73 @@ export class H1ServerConnection implements ProtocolConnection {
                 this.chunkedEncoding = true;
             }
         }
-        let raw = `HTTP/${this.requestHttpVersion} ${status} ${statusText}\r\n`;
-        if (!hasHeader('connection')) raw += this.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
-        for (const [k, v] of headers) raw += `${k}: ${v}\r\n`;
-        raw += "\r\n";
-        await this.socket.write(engine.encodeString(raw));
+        // No framing given by the handler: chunked on 1.1, close-delimited otherwise (Node parity).
+        const needsFraming = !isBodyForbiddenStatus && this.method !== 'HEAD'
+            && !this.chunkedEncoding && !hasHeader('content-length');
+        if (needsFraming) {
+            if (this.requestHttpVersion === '1.0' || hasHeader('transfer-encoding')) this.keepAlive = false;
+            else this.chunkedEncoding = true;
+        }
+        this.responseFramed = !needsFraming || this.chunkedEncoding;
+        const outHeaders = headers.slice();
+        if (needsFraming && this.chunkedEncoding) outHeaders.push(['transfer-encoding', 'chunked']);
+        if (!hasHeader('connection')) {
+            outHeaders.push(['Connection', this.keepAlive ? 'keep-alive' : 'close']);
+        }
+        // Node adds Keep-Alive: timeout=<sec> when the connection stays open.
+        if (this.keepAlive && !hasHeader('keep-alive') && this.keepAliveTimeoutMs > 0) {
+            const sec = Math.max(1, Math.floor(this.keepAliveTimeoutMs / 1000));
+            outHeaders.push(['Keep-Alive', `timeout=${sec}`]);
+        }
+        try {
+            await this.socket.write(encodeResponseHead(this.requestHttpVersion, status, statusText, outHeaders));
+        } catch (err) {
+            const e = err instanceof Error ? err : new Error(String(err));
+            this.markTransportError(e);
+            throw e;
+        }
         this.headersSent = true;
     }
 
     async writeData(chunk: Uint8Array | string): Promise<void> {
+        this.throwIfTransportDead();
         if (this.responseEnded) throw new Error("Response already ended");
         if (!this.headersSent) { if (this.requestHttpVersion === "1.0") { this.keepAlive = false; await this.writeHead(200, "OK", []); } else { this.chunkedEncoding = true; await this.writeHead(200, "OK", [['transfer-encoding', 'chunked']]); } }
         let data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
         if (this.compressor) data = this.compressor.compress(data);
-        if (this.chunkedEncoding) { await this.socket.write(engine.encodeString(data.length.toString(16) + "\r\n")); await this.socket.write(data); await this.socket.write(engine.encodeString("\r\n")); }
-        else await this.socket.write(data);
+        try {
+            if (this.chunkedEncoding) await this.socket.write(encodeChunkedFrame(data));
+            else await this.socket.write(data);
+        } catch (err) {
+            const e = err instanceof Error ? err : new Error(String(err));
+            this.markTransportError(e);
+            throw e;
+        }
     }
 
     async endResponse(chunk?: Uint8Array | string): Promise<void> {
         if (this.responseEnded) return;
+        this.throwIfTransportDead();
         if (chunk !== undefined) await this.writeData(chunk);
         else if (!this.headersSent) await this.writeHead(200, "OK", [['content-length', '0']]);
-        if (this.compressor) {
-            const tail = this.compressor.finish();
-            if (tail.length > 0 && this.chunkedEncoding) {
-                await this.socket.write(engine.encodeString(tail.length.toString(16) + "\r\n"));
-                await this.socket.write(tail);
-                await this.socket.write(engine.encodeString("\r\n"));
+        try {
+            if (this.compressor) {
+                const tail = this.compressor.finish();
+                if (tail.length > 0 && this.chunkedEncoding) {
+                    await this.socket.write(encodeChunkedFrame(tail));
+                }
             }
+            if (this.chunkedEncoding) {
+                await this.socket.write(encodeChunkedTrailer());
+                this.chunkedEncoding = false;
+            }
+            // Unframed body (1.0 / handler-supplied TE): EOF is the only terminator.
+            else if (!this.responseFramed) this.keepAlive = false;
+        } catch (err) {
+            const e = err instanceof Error ? err : new Error(String(err));
+            this.markTransportError(e);
+            throw e;
         }
-        if (this.chunkedEncoding) { await this.socket.write(engine.encodeString("0\r\n\r\n")); this.chunkedEncoding = false; }
         this.compressor = null; this.compressEncoding = null; this.responseEnded = true;
     }
 
@@ -475,6 +580,8 @@ export class H1ServerConnection implements ProtocolConnection {
     close(): void {
         if (this._closed) return;
         this._closed = true;
+        // Pending body/waiters: local close looks like peer EOF to upper layers.
+        if (!this.ended) this.failBody(this.transportError ?? this.peerClosedError());
         this.socket.close();
         this.events.onClose?.();
     }
@@ -543,7 +650,9 @@ class H1Client implements ProtocolClient {
 
 class H1Server implements ProtocolServer {
     readonly version = HttpVersion.HTTP11;
-    async accept(socket: TcpSocket, config: ProtocolServerConfig): Promise<ProtocolConnection> { return new H1ServerConnection(socket, config.secure); }
+    async accept(socket: TcpSocket, config: ProtocolServerConfig): Promise<ProtocolConnection> {
+        return new H1ServerConnection(socket, config.secure, config.keepAliveTimeout);
+    }
     negotiate(alpn?: string): HttpVersion | null { return (!alpn || alpn === ALPN.HTTP11 || alpn === ALPN.HTTP10) ? HttpVersion.HTTP11 : null; }
 }
 

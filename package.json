@@ -1,4 +1,4 @@
-﻿{
+{
     "name": "@cnojs/http",
     "version": "1.0.0",
     "description": "Low-level HTTP protocol library for cno server",
@@ -15,6 +15,9 @@
         "./zlib": "./src/zlib.ts",
         "./protocol": "./src/protocol.ts",
         "./h1": "./src/h1.ts",
+        "./h1-frame": "./src/h1-frame.ts",
+        "./h2": "./src/h2.ts",
+        "./h2-native": "./src/h2-native.ts",
         "./ext-h2": "./ext-h2/http2.d.ts",
         "./server": "./src/server.ts",
         "./debug": "./src/debug.ts",

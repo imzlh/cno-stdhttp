@@ -1,12 +1,11 @@
 /**
  * Core Server Layer
- * NOTE: currently only h1 is supported
  *
- * Accepts connections and serves HTTP/1.x requests.
- * Routes incoming requests to the handler via the H1 protocol layer.
+ * Accepts connections and serves HTTP/1.x and HTTP/2 (when ext-h2 is linked).
+ * Routes via ALPN (TLS) or configured protocols (cleartext h2c when only HTTP/2).
  *
  * Architecture:
- *   TCP accept -> optional TLS handshake -> H1 handler loop
+ *   TCP accept -> optional TLS+ALPN -> H1 loop or H2 multiplexed streams
  */
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -18,10 +17,12 @@ function isTcpStream(stream: CModuleStreams.Stream): stream is CModuleStreams.TC
 
 import { TcpSocket, type ISocket } from "./socket";
 import { h1, H1ServerConnection } from "./h1";
+import { h2, type H2Connection, type H2Stream } from "./h2";
+import { h2Available } from "./h2-native";
 import {
     type RawRequest, type RawResponse,
     type ProtocolConnection, type ProtocolServerConfig, type ProtocolClientConfig,
-    HttpVersion, ALPN,
+    HttpVersion, ALPN, defaultAlpnProtocols,
     type StreamPoll
 } from "./protocol";
 import { assert } from "../utils/assert";
@@ -91,8 +92,11 @@ interface IProtocol {
 /* ------------------------------------------------------------------ */
 
 const PROTOCOL_MODULES = new Map<HttpVersion, IProtocol>([
-    [HttpVersion.HTTP11, h1]
+    [HttpVersion.HTTP11, h1],
 ]);
+if (h2Available()) {
+    PROTOCOL_MODULES.set(HttpVersion.HTTP2, h2);
+}
 
 /* ------------------------------------------------------------------ */
 /* Server                                                             */
@@ -136,7 +140,13 @@ export class Server {
     listen(): void {
         assert(!this.listening, "Server already listening");
         if (this.config.cert && this.config.key) {
-            this.sslContext = new ssl.Context({ mode: "server", cert: this.config.cert, key: this.config.key });
+            const alpn = defaultAlpnProtocols(this.config.protocols);
+            this.sslContext = new ssl.Context({
+                mode: "server",
+                cert: this.config.cert,
+                key: this.config.key,
+                alpn: alpn.length > 0 ? alpn : undefined,
+            });
         }
         if (this.config.path) {
             this.listener = new streams.Pipe();
@@ -174,6 +184,8 @@ export class Server {
             }
             const tcpSocket = new TcpSocket(client);
             this.handleConnection(tcpSocket).catch((e: Error) => {
+                // Handshake/negotiation rejects before registration: close or the fd leaks.
+                tcpSocket.close();
                 if (!TcpSocket.isDisconnectError(e)) console.error("Connection error:", e);
             });
         };
@@ -227,10 +239,7 @@ export class Server {
 
         const protoConfig: ProtocolServerConfig = {
             secure,
-            alpnProtocols: this.config.protocols.map(p => {
-                if (p === HttpVersion.HTTP11) return ALPN.HTTP11;
-                return ALPN.HTTP10;
-            }),
+            alpnProtocols: defaultAlpnProtocols(this.config.protocols),
             cert: this.config.cert, key: this.config.key,
             maxConcurrentStreams: 100,
             keepAliveTimeout: this.config.keepAliveTimeout,
@@ -242,6 +251,18 @@ export class Server {
         const protoConn = await protoModule.server.accept(socket, protoConfig);
         this.connections.add(protoConn);
 
+        if (version === HttpVersion.HTTP2) {
+            await this.h2RequestLoop(protoConn as H2Connection, socket);
+            this.connections.delete(protoConn);
+            if (this.draining && this.connections.size === 0) this._completeDrain();
+            try {
+                protoConn.close();
+            } catch {
+                /* already closed */
+            }
+            return;
+        }
+
         // Set up event handlers
         protoConn.on({
             onError: (err: Error) => console.error(`Protocol error:`, err),
@@ -251,23 +272,178 @@ export class Server {
             },
         });
 
-        await this.h1RequestLoop(protoConn as import("./h1").H1ServerConnection);
+        await this.h1RequestLoop(protoConn as H1ServerConnection);
         // Non-upgraded connections: close so onClose fires and cleans up the set.
         // Upgraded connections (WebSocket etc.) stay in the set; their close() is
         // called either by the protocol layer or by shutdown().
-        if (!(protoConn as import("./h1").H1ServerConnection).isUpgraded) {
+        if (!(protoConn as H1ServerConnection).isUpgraded) {
             protoConn.close();
         }
     }
 
     private negotiateProtocol(alpnProtocol?: string): HttpVersion | null {
-        if (!alpnProtocol || alpnProtocol === ALPN.HTTP11 || alpnProtocol === ALPN.HTTP10) return HttpVersion.HTTP11;
+        const allowed = this.config.protocols;
+        const allow = (v: HttpVersion) => allowed.includes(v);
+
+        if (alpnProtocol === ALPN.HTTP2 || alpnProtocol === ALPN.HTTP2C) {
+            return allow(HttpVersion.HTTP2) ? HttpVersion.HTTP2 : null;
+        }
+        if (alpnProtocol === ALPN.HTTP11 || alpnProtocol === ALPN.HTTP10) {
+            return allow(HttpVersion.HTTP11) ? HttpVersion.HTTP11 : null;
+        }
+        // No ALPN: TLS falls back to H1; cleartext may be prior-knowledge h2c
+        // only when HTTP/2 is configured and H1 is not.
+        if (!alpnProtocol) {
+            if (!this.sslContext && allow(HttpVersion.HTTP2) && !allow(HttpVersion.HTTP11)) {
+                return HttpVersion.HTTP2;
+            }
+            if (allow(HttpVersion.HTTP11)) return HttpVersion.HTTP11;
+            if (allow(HttpVersion.HTTP2)) return HttpVersion.HTTP2;
+        }
         return null;
     }
 
     /* -------------------------------------------------------------- */
     /* HTTP request loop                                              */
     /* -------------------------------------------------------------- */
+
+    private async h2RequestLoop(conn: H2Connection, socket: TcpSocket): Promise<void> {
+        await new Promise<void>(resolve => {
+            let done = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                resolve();
+            };
+            conn.on({
+                onClose: finish,
+                onError: (err: Error) => {
+                    if (!TcpSocket.isDisconnectError(err)) console.error('HTTP/2 protocol error:', err);
+                    finish();
+                },
+            });
+            conn.onStreamOpen = stream => {
+                void this.handleH2Stream(stream).catch((e: Error) => {
+                    if (!TcpSocket.isDisconnectError(e)) {
+                        try {
+                            if (this.onRequestError) this.onRequestError(e, socket);
+                            else console.error('HTTP/2 request error:', e);
+                        } catch (cbErr) {
+                            console.error('onRequestError threw:', cbErr);
+                        }
+                    }
+                    try {
+                        stream.abort();
+                    } catch {
+                        /* */
+                    }
+                });
+            };
+        });
+    }
+
+    private async handleH2Stream(stream: H2Stream): Promise<void> {
+        await new Promise<void>(resolve => {
+            stream.whenHeaders(() => resolve());
+        });
+        const headers = stream.headerList ?? [];
+        let method = 'GET';
+        let url = '/';
+        let authority: string | undefined;
+        const raw: Array<[string, string]> = [];
+        for (const [n, v] of headers) {
+            const lower = n.toLowerCase();
+            if (lower === ':method') method = v;
+            else if (lower === ':path') url = v;
+            else if (lower === ':authority') authority = v;
+            else if (!n.startsWith(':')) raw.push([n, v]);
+        }
+        if (authority && !raw.some(([n]) => n.toLowerCase() === 'host')) {
+            raw.push(['host', authority]);
+        }
+        // Web Request forbids a body on GET/HEAD; keep poll only when needed.
+        const body = (method === 'GET' || method === 'HEAD')
+            ? null
+            : this.h2BodyPoll(stream);
+        const httpReq: HttpRequest = {
+            method,
+            url,
+            httpVersion: '2.0',
+            headers: raw,
+            body,
+        };
+        const httpRes = this.toH2HttpResponse(stream);
+        await this.handler(httpReq, httpRes);
+    }
+
+    private h2BodyPoll(stream: H2Stream): StreamPoll {
+        const gen = stream.bodyChunks();
+        return async () => {
+            const next = await gen.next();
+            return next.done ? null : next.value;
+        };
+    }
+
+    private toH2HttpResponse(stream: H2Stream): HttpResponse {
+        let headersSent = false;
+        const response: HttpResponse = {
+            status: 200,
+            statusText: 'OK',
+            headers: [],
+            writeHead: async (status: number, _statusText?: string, headers?: Array<[string, string]>) => {
+                if (headersSent) return;
+                headersSent = true;
+                const h2h: Array<[string, string]> = [[':status', String(status)]];
+                for (const [n, v] of headers ?? []) {
+                    const lower = n.toLowerCase();
+                    // H2 forbids connection-specific hop-by-hop headers
+                    if (lower === 'connection' || lower === 'transfer-encoding' || lower === 'keep-alive'
+                        || lower === 'proxy-connection' || lower === 'upgrade') {
+                        continue;
+                    }
+                    h2h.push([n, v]);
+                }
+                stream.respond(h2h, false);
+            },
+            write: async (chunk: Uint8Array | string) => {
+                if (!headersSent) {
+                    await response.writeHead(200, 'OK', [['content-type', 'application/octet-stream']]);
+                }
+                const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
+                stream.sendData(data, false);
+            },
+            end: async (chunk?: Uint8Array | string) => {
+                if (!headersSent) {
+                    headersSent = true;
+                    if (chunk !== undefined) {
+                        const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
+                        stream.respond([[':status', '200']], false);
+                        stream.sendData(data, true);
+                    } else {
+                        stream.respond([[':status', '200']], true);
+                    }
+                    return;
+                }
+                if (chunk !== undefined) {
+                    const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
+                    stream.sendData(data, true);
+                } else {
+                    stream.sendData(new Uint8Array(0), true);
+                }
+            },
+            upgrade: () => {
+                throw new Error('HTTP/2 does not support connection upgrade');
+            },
+            close: () => {
+                try {
+                    stream.abort();
+                } catch {
+                    /* */
+                }
+            },
+        };
+        return response;
+    }
 
     private async h1RequestLoop(conn: H1ServerConnection): Promise<void> {
         let keepAlive = true;
