@@ -147,6 +147,10 @@ export interface ProtocolServerConfig {
     maxConcurrentStreams?: number;
     keepAliveTimeout?: number;
     requestTimeout?: number;
+    /** Max header count per request. Reject requests with more headers than this. */
+    maxHeadersCount?: number;
+    /** Max concurrent connections the server accepts. */
+    maxConnections?: number;
 }
 
 export interface ProtocolServer {

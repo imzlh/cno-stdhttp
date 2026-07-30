@@ -46,6 +46,33 @@ function decodeParserBytes(buf: CModuleHTTP.BufferSource, off: number, len: numb
     return engine.decodeString(toByteView(buf).slice(off, off + len));
 }
 
+// RFC 7230 §3.3.1: `chunked` must be the last coding. Substring match ("xchunked") is a desync vector.
+export function isChunkedEncoding(transferEncoding: string | undefined | null): boolean {
+    if (!transferEncoding) return false;
+    const codings = transferEncoding.split(',').map(c => c.trim().toLowerCase()).filter(Boolean);
+    return codings.length > 0 && codings[codings.length - 1] === 'chunked';
+}
+
+// RFC 7230 §3.2.4: header names/values must not contain CR/LF/NUL. Rejects at parse time.
+function validateHeader(name: string, value: string): void {
+    if (/[\r\n\0]/.test(name) || /[\r\n\0]/.test(value)) {
+        throw new Error(`invalid header: ${JSON.stringify(name)}`);
+    }
+}
+
+// Parses Content-Length with strict validation: single finite non-negative integer.
+// Returns -1 on any malformed value (negative, non-numeric, multiple headers).
+function parseContentLength(clHeader: string | undefined, reqHeaders: Array<[string, string]>): number {
+    if (clHeader === undefined) return -1;
+    const count = reqHeaders.filter(([n]) => n === 'content-length').length;
+    if (count > 1) return -1;
+    const v = clHeader.trim();
+    if (!/^\d+$/.test(v)) return -1;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return -1;
+    return n;
+}
+
 /* ------------------------------------------------------------------ */
 /* HTTP/1.x Request Builder (low-level: strings + bytes, no URL/Headers) */
 /* ------------------------------------------------------------------ */
@@ -148,7 +175,11 @@ export class HttpResponseParser {
     private setupCallbacks(): void {
         this.parser.onStatus = (buf, off, len) => { this.statusText = decodeParserBytes(buf, off, len); };
         this.parser.onHeaderField = (buf, off, len) => { this.currentHeaderField = decodeParserBytes(buf, off, len).toLowerCase(); };
-        this.parser.onHeaderValue = (buf, off, len) => { this.headers.push([this.currentHeaderField, decodeParserBytes(buf, off, len)]); this.currentHeaderField = ''; };
+        this.parser.onHeaderValue = (buf, off, len) => {
+            const name = this.currentHeaderField, value = decodeParserBytes(buf, off, len);
+            validateHeader(name, value);
+            this.headers.push([name, value]); this.currentHeaderField = '';
+        };
         this.parser.onHeadersComplete = () => {
             this.statusCode = this.parser.state.status; this.headersComplete = true;
             if (!this.statusText) this.statusText = strstatus(this.statusCode);
@@ -170,7 +201,7 @@ export class HttpResponseParser {
 
     feed(data: Uint8Array): CModuleHTTP.ParserExecuteResult | undefined {
         try {
-            const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.length + data.byteOffset));
+            const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
             if (result.errno !== 0) {
                 if (result.name === 'HPE_PAUSED_UPGRADE') return result;
                 const e = new Error(`HTTP parse error: ${result.reason}`); if (this.onError) this.onError(e); else throw e;
@@ -240,6 +271,7 @@ export class H1ServerConnection implements ProtocolConnection {
     readonly socket: TcpSocket;
     /** Idle keep-alive timeout (ms); Node emits Keep-Alive: timeout=<sec> from this. */
     private keepAliveTimeoutMs: number;
+    private maxHeadersCount: number;
     private parser: CModuleHTTP.Parser;
     private method = ''; private url = ''; private reqHeaders: Array<[string, string]> = [];
     private headerField = ''; private headersOk = false;
@@ -263,10 +295,11 @@ export class H1ServerConnection implements ProtocolConnection {
     private transportError: Error | null = null;
     private ended = false;
 
-    constructor(socket: TcpSocket, secure: boolean, keepAliveTimeoutMs = 5000) {
+    constructor(socket: TcpSocket, secure: boolean, keepAliveTimeoutMs = 5000, maxHeadersCount: number = 2000) {
         this.socket = socket;
         this.secure = secure;
         this.keepAliveTimeoutMs = keepAliveTimeoutMs;
+        this.maxHeadersCount = maxHeadersCount;
         this.parser = new http.Parser(http.REQUEST);
         this.setupParser();
     }
@@ -326,12 +359,17 @@ export class H1ServerConnection implements ProtocolConnection {
         this.parser.onUrl = (buf, off, len) => { this.url += decodeParserBytes(buf, off, len); };
         this.parser.onHeaderField = (buf, off, len) => { this.headerField = decodeParserBytes(buf, off, len).toLowerCase(); };
         this.parser.onHeaderValue = (buf, off, len) => {
-            this.reqHeaders.push(
-                [this.headerField.toLowerCase(), decodeParserBytes(buf, off, len)]
-            )
+            const name = this.headerField.toLowerCase();
+            const value = decodeParserBytes(buf, off, len);
+            validateHeader(name, value);
+            this.reqHeaders.push([name, value]);
         };
         this.parser.onHeadersComplete = () => {
             this.method = HTTP_METHODS[this.parser.state.method] ?? 'UNKNOWN'; this.headersOk = true;
+            if (this.maxHeadersCount > 0 && this.reqHeaders.length > this.maxHeadersCount) {
+                this.failBody(new Error(`request exceeds max headers (${this.maxHeadersCount})`));
+                return;
+            }
             const connH = this.reqHeaders.find(([n]) => n === 'connection')?.[1];
             const ver = `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`;
             this.requestHttpVersion = ver;
@@ -340,10 +378,13 @@ export class H1ServerConnection implements ProtocolConnection {
             if (ae) this.compressEncoding = pickEncoding(parseAcceptEncoding(ae));
             const cl = this.reqHeaders.find(([n]) => n === 'content-length')?.[1];
             const te = this.reqHeaders.find(([n]) => n === 'transfer-encoding')?.[1];
-            if (cl) {
-                this.contentLength = parseInt(cl); this.expectBody = this.contentLength > 0;
-            } else if (te?.toLowerCase().includes('chunked')) {
+            // RFC 7230 §3.3.3: TE wins when both CL and TE are present (closes CL.TE smuggling).
+            if (isChunkedEncoding(te)) {
                 this.chunked = true; this.expectBody = true;
+            } else if (cl) {
+                const len = parseContentLength(cl, this.reqHeaders);
+                if (len < 0) { this.failBody(new Error('invalid Content-Length')); return; }
+                this.contentLength = len; this.expectBody = len > 0;
             }
         };
         this.parser.onBody = (buf, off, len) => {
@@ -651,7 +692,7 @@ class H1Client implements ProtocolClient {
 class H1Server implements ProtocolServer {
     readonly version = HttpVersion.HTTP11;
     async accept(socket: TcpSocket, config: ProtocolServerConfig): Promise<ProtocolConnection> {
-        return new H1ServerConnection(socket, config.secure, config.keepAliveTimeout);
+        return new H1ServerConnection(socket, config.secure, config.keepAliveTimeout, config.maxHeadersCount);
     }
     negotiate(alpn?: string): HttpVersion | null { return (!alpn || alpn === ALPN.HTTP11 || alpn === ALPN.HTTP10) ? HttpVersion.HTTP11 : null; }
 }

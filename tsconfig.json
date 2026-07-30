@@ -1,11 +1,7 @@
 {
-    // Visit https://aka.ms/tsconfig to read more about this file
     "compilerOptions": {
-        // File Layout
         "rootDir": "./",
         "outDir": "./dist",
-        // Environment Settings
-        // See also https://aka.ms/tsconfig/module
         "module": "esnext",
         "target": "esnext",
         "moduleResolution": "bundler",
@@ -14,48 +10,30 @@
         "paths": {
             "h2": ["./ext-h2/http2.d.ts"]
         },
-        // "types": [],
-        "typeRoots": [
-            "types/"
-        ],
-        // For nodejs:
+        "typeRoots": [],
         "lib": [
             "esnext"
         ],
-        // "types": ["node"],
-        // and npm install -D @types/node
-        // Other Outputs
         "sourceMap": true,
         "declaration": true,
         "declarationMap": true,
-        // Stricter Typechecking Options
         "noUncheckedIndexedAccess": true,
         "exactOptionalPropertyTypes": false,
-        // Style Options
-        // "noImplicitReturns": true,
-        // "noImplicitOverride": true,
-        // "noUnusedLocals": true,
-        // "noUnusedParameters": true,
-        // "noFallthroughCasesInSwitch": true,
-        // "noPropertyAccessFromIndexSignature": true,
-        // Recommended Options
-        // "strict": true,
         "jsx": "react-jsx",
         "verbatimModuleSyntax": true,
         "isolatedModules": true,
-        // "noUncheckedSideEffectImports": true,
         "moduleDetection": "force",
         "skipLibCheck": true,
         "allowJs": true
     },
-    "typedocOptions": {
-        "name": "circu.js",
-        "entryPoints": [
-            "types/"
-        ],
-        "entryPointStrategy": "expand",
-        "out": "../api/",
-        "disableSources": true
-    },
-    "exclude": ["deps/sucrase/**/*"]
+    "include": [
+        "src/**/*",
+        "ext-h2/**/*.d.ts",
+        "types/**/*.d.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "dist",
+        "deps/**/*"
+    ]
 }

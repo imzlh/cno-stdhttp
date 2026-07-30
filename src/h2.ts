@@ -379,6 +379,9 @@ export class H2Connection implements ProtocolConnection {
         sess.ondata = (streamId: number, chunk: Uint8Array, endStream: boolean) => {
             const stream = this.streams.get(streamId);
             if (stream) stream.acceptData(chunk, endStream);
+            // Replenish the receive window once the app has the bytes; without this the
+            // default 65535-byte connection window exhausts and all streams deadlock.
+            if (chunk.byteLength > 0) this.session.consume(streamId, chunk.byteLength);
         };
         sess.onheaders = (streamId: number, headers: H2Header[], flags: number) => {
             const stream = this.streams.get(streamId);

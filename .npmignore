@@ -1,0 +1,7 @@
+types/
+*.jsc
+*.tgz
+tsconfig.json
+.npmrc
+.gitignore
+.git/

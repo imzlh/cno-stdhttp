@@ -1163,6 +1163,33 @@ done:
     return result;
 }
 
+// Replenish the connection-level receive window so a peer that keeps sending is not
+// stalled once the app has consumed the data. Without this the default 65535-byte
+// window exhausts and all streams on the connection deadlock (nghttp2 flow-control pitfall).
+static JSValue js_h2_consume(JSContext *ctx, JSValue this_val,
+                              int argc, JSValue *argv) {
+    H2Session *s = h2_get(ctx, this_val);
+    if (!s) return JS_EXCEPTION;
+    nghttp2_session *ng;
+    if (!h2_operation_enter(s, &ng)) return JS_UNDEFINED;
+    JSValue result = JS_UNDEFINED;
+    int32_t streamId, length;
+    if (argc < 2) { result = JS_ThrowTypeError(ctx, "consume(streamId, length)"); goto done; }
+    if (JS_ToInt32(ctx, &streamId, argv[0]) < 0 ||
+        JS_ToInt32(ctx, &length, argv[1]) < 0) {
+        result = JS_EXCEPTION; goto done;
+    }
+    if (s->destroy_pending || length <= 0) goto done;
+    int rc = nghttp2_session_consume(ng, streamId, length);
+    // A closed/unknown stream makes the per-stream call fail; fall back to connection-level
+    // consumption so the connection receive window is always replenished (deadlock guard).
+    if (rc < 0 && streamId != 0) rc = nghttp2_session_consume(ng, 0, length);
+    if (rc < 0) result = h2_ng_error(ctx, "consume", rc);
+done:
+    h2_operation_leave(s);
+    return result;
+}
+
 static JSValue js_h2_ping(JSContext *ctx, JSValue this_val,
                            int argc, JSValue *argv) {
     H2Session *s = h2_get(ctx, this_val);
@@ -1429,6 +1456,7 @@ static const JSCFunctionListEntry h2_proto[] = {
     JS_CFUNC_DEF("write",     3, js_h2_write),
     JS_CFUNC_DEF("trailers",  2, js_h2_trailers),
     JS_CFUNC_DEF("reset",     2, js_h2_reset),
+    JS_CFUNC_DEF("consume",   2, js_h2_consume),
     JS_CFUNC_DEF("wndUpdate", 2, js_h2_wnd_update),
     JS_CFUNC_DEF("ping",      2, js_h2_ping),
     JS_CFUNC_DEF("configure", 1, js_h2_configure),

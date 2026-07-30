@@ -38,6 +38,7 @@ declare namespace CModuleExternalHTTP2 {
         write(streamId: number, data: Uint8Array | ArrayBuffer, endStream?: boolean): void;
         trailers(streamId: number, headers: Header[]): void;
         reset(streamId: number, errorCode?: number): void;
+        consume(streamId: number, length: number): void;
         wndUpdate(streamId: number, delta: number): void;
         ping(payload?: Uint8Array, isAck?: boolean): void;
         configure(settings: Settings): void;

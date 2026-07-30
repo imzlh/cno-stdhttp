@@ -30,6 +30,7 @@ export function encodeHead(startLine: string, headerBlock = ''): Uint8Array {
 function formatPairs(headers: Array<[string, string]>): string {
     let block = '';
     for (const [k, v] of headers) {
+        if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) throw new Error(`invalid header: ${JSON.stringify(k)}`);
         if (k) block += `${k}: ${v}\r\n`;
     }
     return block;

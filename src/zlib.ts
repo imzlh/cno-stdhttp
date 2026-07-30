@@ -7,6 +7,9 @@ const zlib = import.meta.use("zlib");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
+// Zip-bomb guard: cumulative decompressed output per stream may not exceed this.
+export const MAX_DECOMPRESS_BYTES = 256 * 1024 * 1024;
+
 /** Parse Accept-Encoding header into ordered list of supported algorithms. */
 export function parseAcceptEncoding(header: string | null | undefined): ('gzip' | 'deflate')[] {
     if (!header) return [];
@@ -48,15 +51,31 @@ export function shouldCompress(contentType: string | null): boolean {
            ct.endsWith('+json') || ct.endsWith('+xml');
 }
 
-/** Create a one-shot decompressor. */
-export function createDecompressor(encoding: string): ((data: Uint8Array) => Uint8Array) | null {
+/** Create a one-shot decompressor. Output capped to guard against zip bombs. */
+export function createDecompressor(encoding: string, maxOutput = MAX_DECOMPRESS_BYTES): ((data: Uint8Array) => Uint8Array) | null {
     const enc = encoding.toLowerCase().trim();
-    if (enc === 'gzip') return (data) => new Uint8Array(zlib.gunzip(data));
-    if (enc === 'deflate') return (data) => {
-        try { return new Uint8Array(zlib.inflate(data)); }
-        catch { return new Uint8Array(zlib.inflateRaw(data)); }
-    };
+    if (enc === 'gzip') return bombGuard(zlib.gunzip, maxOutput);
+    if (enc === 'deflate') {
+        // Reuse guards so cumulative output is tracked across calls (and raw fallback).
+        const inflate = bombGuard(zlib.inflate, maxOutput);
+        const inflateRaw = bombGuard(zlib.inflateRaw, maxOutput);
+        return (data) => {
+            try { return inflate(data); }
+            catch { return inflateRaw(data); }
+        };
+    }
     return null;
+}
+
+// Wraps a one-shot decompressor, throwing once cumulative output exceeds maxOutput (zip-bomb guard).
+function bombGuard(fn: (d: Uint8Array) => ArrayBuffer, maxOutput: number): (data: Uint8Array) => Uint8Array {
+    let total = 0;
+    return (data) => {
+        const out = new Uint8Array(fn(data));
+        total += out.length;
+        if (total > maxOutput) throw new Error(`decompressed output exceeds ${maxOutput} bytes`);
+        return out;
+    };
 }
 
 /** Streaming decompressor for incremental decompression. */
@@ -64,8 +83,11 @@ export class StreamingDecompressor {
     private _stream: ReturnType<typeof zlib.createGunzip> | null;
     private _encoding: string;
     private _deflateRawFallback = false;
-    constructor(encoding: string) {
+    private _total = 0;
+    private _maxOutput: number;
+    constructor(encoding: string, maxOutput = MAX_DECOMPRESS_BYTES) {
         this._encoding = encoding.toLowerCase().trim();
+        this._maxOutput = maxOutput;
         if (this._encoding === 'gzip') this._stream = zlib.createGunzip();
         else if (this._encoding === 'deflate') this._stream = zlib.createInflate();
         else this._stream = null;
@@ -73,12 +95,18 @@ export class StreamingDecompressor {
     decompress(chunk: Uint8Array): Uint8Array {
         if (!this._stream || chunk.length === 0) return chunk;
         try {
-            return new Uint8Array(this._stream.inflate(chunk));
+            const out = new Uint8Array(this._stream.inflate(chunk));
+            this._total += out.length;
+            if (this._total > this._maxOutput) throw new Error(`decompressed output exceeds ${this._maxOutput} bytes`);
+            return out;
         } catch (err) {
             if (this._encoding === 'deflate' && !this._deflateRawFallback) {
                 this._deflateRawFallback = true;
                 this._stream = zlib.createInflateRaw();
-                return new Uint8Array(this._stream.inflate(chunk));
+                const out = new Uint8Array(this._stream.inflate(chunk));
+                this._total += out.length;
+                if (this._total > this._maxOutput) throw new Error(`decompressed output exceeds ${this._maxOutput} bytes`);
+                return out;
             }
             throw err;
         }

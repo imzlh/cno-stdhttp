@@ -48,6 +48,8 @@ export interface ServerConfig {
     maxRequestsPerConnection?: number;
     requestTimeout?: number;
     protocols?: HttpVersion[];
+    maxHeadersCount?: number;
+    maxConnections?: number;
 }
 
 export type RequestHandler = (req: HttpRequest, res: HttpResponse) => void | Promise<void>;
@@ -134,6 +136,8 @@ export class Server {
             maxRequestsPerConnection: config.maxRequestsPerConnection ?? 100,
             requestTimeout: config.requestTimeout ?? 300000,
             protocols: config.protocols ?? [HttpVersion.HTTP11],
+            maxHeadersCount: config.maxHeadersCount ?? 2000,
+            maxConnections: config.maxConnections ?? 0,
         };
     }
 
@@ -178,6 +182,11 @@ export class Server {
             }
             if (!client) return;
             if (this.draining) { client.close(); return; }
+            // Max connections: reject new connections once at capacity (DoS backpressure).
+            if (this.config.maxConnections > 0 && this.connections.size >= this.config.maxConnections) {
+                client.close();
+                return;
+            }
             if (isTcpStream(client)) {
                 client.setNoDelay(true);
                 client.setKeepAlive(true, 1000);
@@ -244,6 +253,8 @@ export class Server {
             maxConcurrentStreams: 100,
             keepAliveTimeout: this.config.keepAliveTimeout,
             requestTimeout: this.config.requestTimeout,
+            maxHeadersCount: this.config.maxHeadersCount,
+            maxConnections: this.config.maxConnections,
         };
 
         const protoModule = PROTOCOL_MODULES.get(version);
