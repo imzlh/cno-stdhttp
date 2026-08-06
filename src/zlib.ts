@@ -56,24 +56,35 @@ export function createDecompressor(encoding: string, maxOutput = MAX_DECOMPRESS_
     const enc = encoding.toLowerCase().trim();
     if (enc === 'gzip') return bombGuard(zlib.gunzip, maxOutput);
     if (enc === 'deflate') {
-        // Reuse guards so cumulative output is tracked across calls (and raw fallback).
-        const inflate = bombGuard(zlib.inflate, maxOutput);
-        const inflateRaw = bombGuard(zlib.inflateRaw, maxOutput);
+        // One shared budget across both attempts: separate counters would charge the
+        // failed inflate's output twice and let the raw path decode a second full
+        // maxOutput on top of it.
+        const budget = { total: 0 };
+        const inflate = bombGuard(zlib.inflate, maxOutput, budget);
+        const inflateRaw = bombGuard(zlib.inflateRaw, maxOutput, budget);
         return (data) => {
+            const before = budget.total;
             try { return inflate(data); }
-            catch { return inflateRaw(data); }
+            catch {
+                // Roll back the failed attempt's charge; it produced nothing usable.
+                budget.total = before;
+                return inflateRaw(data);
+            }
         };
     }
     return null;
 }
 
 // Wraps a one-shot decompressor, throwing once cumulative output exceeds maxOutput (zip-bomb guard).
-function bombGuard(fn: (d: Uint8Array) => ArrayBuffer, maxOutput: number): (data: Uint8Array) => Uint8Array {
-    let total = 0;
+function bombGuard(
+    fn: (d: Uint8Array) => ArrayBuffer,
+    maxOutput: number,
+    budget: { total: number } = { total: 0 },
+): (data: Uint8Array) => Uint8Array {
     return (data) => {
         const out = new Uint8Array(fn(data));
-        total += out.length;
-        if (total > maxOutput) throw new Error(`decompressed output exceeds ${maxOutput} bytes`);
+        budget.total += out.length;
+        if (budget.total > maxOutput) throw new Error(`decompressed output exceeds ${maxOutput} bytes`);
         return out;
     };
 }
@@ -83,6 +94,8 @@ export class StreamingDecompressor {
     private _stream: ReturnType<typeof zlib.createGunzip> | null;
     private _encoding: string;
     private _deflateRawFallback = false;
+    private _produced = false;
+    private _finished = false;
     private _total = 0;
     private _maxOutput: number;
     constructor(encoding: string, maxOutput = MAX_DECOMPRESS_BYTES) {
@@ -96,14 +109,18 @@ export class StreamingDecompressor {
         if (!this._stream || chunk.length === 0) return chunk;
         try {
             const out = new Uint8Array(this._stream.inflate(chunk));
+            this._produced = true;
             this._total += out.length;
             if (this._total > this._maxOutput) throw new Error(`decompressed output exceeds ${this._maxOutput} bytes`);
             return out;
         } catch (err) {
-            if (this._encoding === 'deflate' && !this._deflateRawFallback) {
+            // Raw-deflate retry is only sound on the first chunk. Restarting mid-stream
+            // would decode this chunk against a fresh window and emit garbage.
+            if (this._encoding === 'deflate' && !this._deflateRawFallback && !this._produced) {
                 this._deflateRawFallback = true;
                 this._stream = zlib.createInflateRaw();
                 const out = new Uint8Array(this._stream.inflate(chunk));
+                this._produced = true;
                 this._total += out.length;
                 if (this._total > this._maxOutput) throw new Error(`decompressed output exceeds ${this._maxOutput} bytes`);
                 return out;
@@ -113,6 +130,22 @@ export class StreamingDecompressor {
     }
     get encoding(): string { return this._encoding; }
     get isActive(): boolean { return this._stream !== null; }
+
+    /**
+     * End of compressed input: validate the stream trailer. A body cut short mid-stream
+     * inflates to a short-but-plausible result, so without this a truncated (or
+     * deliberately clipped) response body is indistinguishable from a complete one.
+     * Throws when the stream is incomplete or corrupt; safe to call more than once.
+     */
+    finish(): Uint8Array {
+        const stream = this._stream;
+        if (!stream || this._finished) return new Uint8Array(0);
+        this._finished = true;
+        const out = new Uint8Array(stream.finish());
+        this._total += out.length;
+        if (this._total > this._maxOutput) throw new Error(`decompressed output exceeds ${this._maxOutput} bytes`);
+        return out;
+    }
 }
 
 /** Create a one-shot compressor. */

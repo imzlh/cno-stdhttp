@@ -24,6 +24,23 @@ import { requireH2, type H2Session, type H2Header, type H2Settings, type H2Modul
 type Uint8Array = globalThis.Uint8Array<ArrayBufferLike>;
 
 const END_STREAM = 0x1;
+const EMPTY = new globalThis.Uint8Array(0);
+
+/**
+ * Per-stream ceiling on undelivered request/response body bytes.
+ *
+ * nghttp2 is created here without an `nghttp2_option`, so `no_auto_window_update`
+ * is never set: it refills the flow-control window by itself as soon as DATA is
+ * received (which is why `H2Connection.manualWindow` gives up after the first
+ * `consume()` failure). There is therefore no transport backpressure at all — a
+ * peer can stream an unbounded upload into `H2Stream.chunks` while the handler
+ * never reads it, and the process grows until it dies. Cap the buffer and RST the
+ * offending stream instead; the rest of the connection survives.
+ */
+const MAX_BUFFERED_BODY_BYTES = 16 * 1024 * 1024;
+
+/** SETTINGS_MAX_HEADER_LIST_SIZE default, matching Node's http2 (64 KiB). */
+const DEFAULT_MAX_HEADER_LIST_SIZE = 65535;
 
 function ownedBytes(bytes: Uint8Array): globalThis.Uint8Array<ArrayBuffer> {
     const out = new globalThis.Uint8Array(bytes.byteLength);
@@ -76,7 +93,26 @@ export class H2Stream implements ProtocolStream {
     private headers: H2Header[] | null = null;
     private chunks: Uint8Array[] = [];
     private bodyCursor = 0;
+    /** Bytes sitting in `chunks` that the application has not taken yet. */
+    private buffered = 0;
     private ended = false;
+    /**
+     * True only when the peer set END_STREAM on a HEADERS/DATA frame, or an empty
+     * DATA frame carried it (acceptEnd). `ended` cannot carry this: acceptClose()
+     * and acceptConnectionError() set it too, so a stream cut short by
+     * RST_STREAM(NO_ERROR) was indistinguishable from a clean finish. nghttp2
+     * reports on_stream_close for *every* stream including successful ones
+     * (http/ext-h2/http2.c), so code 0 can never mean "error" by itself — the
+     * only sound signal is whether END_STREAM was actually observed.
+     */
+    private endStreamSeen = false;
+    /**
+     * We closed or aborted this stream. A server handler that answers without
+     * draining the request body legitimately leaves the peer's half open, and
+     * nghttp2 then reports on_stream_close with code 0 — which must not be
+     * reported as the peer truncating a body we chose to stop reading.
+     */
+    private locallyEnded = false;
     private closed = false;
     private headSent = false;
     private messageWaiters: Array<{
@@ -98,27 +134,69 @@ export class H2Stream implements ProtocolStream {
 
     acceptHeaders(headers: H2Header[], flags: number): void {
         this.headers = headers;
-        if (flags & END_STREAM) this.ended = true;
+        if (flags & END_STREAM) { this.ended = true; this.endStreamSeen = true; }
         const cbs = this.headerWaiters.splice(0);
         for (const cb of cbs) cb(headers, this.ended);
         this.tryResolveMessage();
     }
 
     acceptData(chunk: Uint8Array, endStream: boolean): void {
-        if (chunk.byteLength > 0) this.chunks.push(chunk);
-        if (endStream) this.ended = true;
+        // Already failed or closed: nothing will ever read these bytes, so retaining them
+        // only re-grows a buffer we just discarded. Without this a peer that ignores our
+        // RST_STREAM refills up to MAX_BUFFERED_BODY_BYTES and trips the cap again, and
+        // again — one RST per 16 MiB for as long as it keeps sending.
+        if (this.streamError || this.closed) return;
+        if (chunk.byteLength > 0) {
+            this.chunks.push(chunk);
+            this.buffered += chunk.byteLength;
+            // Server only. A server handler drains through bodyChunks(), so the counter
+            // falls as it reads and a draining handler can stream any size; a handler that
+            // ignores the body is the case this protects against. The client side has no
+            // incremental API at all — it merges the whole response in buildMessage() —
+            // so capping there would just cap the largest downloadable response.
+            if (this.isServer && this.buffered > MAX_BUFFERED_BODY_BYTES) {
+                // Nothing is draining this and the window refills itself, so the only way
+                // to stop the flood is to kill the stream. FLOW_CONTROL_ERROR is the
+                // accurate code: the peer outran the buffer we are willing to hold.
+                this.discardBuffer();
+                this.setStreamError(Object.assign(
+                    new Error(
+                        `HTTP/2 stream ${this.id} buffered body exceeds ${MAX_BUFFERED_BODY_BYTES} bytes`,
+                    ),
+                    { code: 'ERR_HTTP2_STREAM_ERROR' },
+                ));
+                this.ended = true;
+                this.closed = true;
+                this.locallyEnded = true;
+                this.conn.resetStream(this.id, 'FLOW_CONTROL_ERROR');
+                this.wakeData();
+                this.tryResolveMessage();
+                return;
+            }
+        }
+        if (endStream) { this.ended = true; this.endStreamSeen = true; }
         this.wakeData();
         this.tryResolveMessage();
     }
 
+    /** Release every retained chunk; the stream is being failed, nobody will read them. */
+    private discardBuffer(): void {
+        this.chunks = [];
+        this.bodyCursor = 0;
+        this.buffered = 0;
+    }
+
     acceptTrailers(headers: H2Header[], flags: number): void {
         this.trailers.push(headers);
-        if (flags & END_STREAM) this.ended = true;
+        if (flags & END_STREAM) { this.ended = true; this.endStreamSeen = true; }
         this.wakeData();
         this.tryResolveMessage();
     }
 
     acceptEnd(): void {
+        // Called from the frame observer for an empty DATA frame with END_STREAM,
+        // which nghttp2 does not surface through ondata. That is a real END_STREAM.
+        this.endStreamSeen = true;
         if (this.ended) return;
         this.ended = true;
         this.wakeData();
@@ -130,6 +208,18 @@ export class H2Stream implements ProtocolStream {
             this.setStreamError(Object.assign(
                 new Error(`HTTP/2 stream closed with error code ${errorCode}`),
                 { code: 'ERR_HTTP2_STREAM_ERROR', errno: errorCode },
+            ));
+        } else if (!this.endStreamSeen && !this.locallyEnded && this.headers !== null) {
+            // The peer's half closed without ever setting END_STREAM. Before this,
+            // `ended` was set here identically to a clean finish, so RST_STREAM(0)
+            // after partial DATA delivered a short body with no error at all — the
+            // handler committed a truncated payload believing it was whole. H1 calls
+            // the same condition ECONNRESET (h1.ts failBody), so match that code.
+            this.setStreamError(Object.assign(
+                new Error(
+                    `HTTP/2 stream ${this.id} closed without END_STREAM: request body truncated`,
+                ),
+                { code: 'ECONNRESET' },
             ));
         }
         this.closed = true;
@@ -225,8 +315,34 @@ export class H2Stream implements ProtocolStream {
     async *bodyChunks(): AsyncGenerator<Uint8Array> {
         for (;;) {
             while (this.bodyCursor < this.chunks.length) {
-                yield this.chunks[this.bodyCursor]!;
+                const chunk = this.chunks[this.bodyCursor]!;
+                // Drop the reference as it leaves: a streamed upload must not be retained
+                // in full for the stream's lifetime just because the cursor moved past it.
+                this.chunks[this.bodyCursor] = EMPTY;
                 this.bodyCursor++;
+                // Compact the consumed prefix once it dominates the array. Nulling a slot
+                // frees the payload but not the slot, so a steadily-draining handler grew
+                // `chunks` by one pointer per DATA frame with `buffered` pinned at 0 —
+                // invisible to the cap, which counts only undelivered bytes. Measured
+                // before this: 2e6 frames -> 2e6 retained slots, +39 MB RSS, 0 resets.
+                // Amortised O(1): splice only runs once the cursor passes the midpoint,
+                // so it moves at most as many entries as were just consumed, and the
+                // array stays O(outstanding) rather than O(total frames).
+                if (this.bodyCursor >= 32 && this.bodyCursor * 2 >= this.chunks.length) {
+                    this.chunks.splice(0, this.bodyCursor);
+                    this.bodyCursor = 0;
+                }
+                // Delivered bytes no longer count against the buffer ceiling, so a handler
+                // that keeps reading can stream a body of any size.
+                this.buffered -= chunk.byteLength;
+                if (this.buffered < 0) this.buffered = 0;
+                yield chunk;
+            }
+            // Fully drained: drop the array outright. Cheaper than splicing and it also
+            // covers the burst case where the loop exits with a consumed prefix left.
+            if (this.bodyCursor > 0 && this.bodyCursor === this.chunks.length) {
+                this.chunks.length = 0;
+                this.bodyCursor = 0;
             }
             if (this.streamError) throw this.streamError;
             if (this.ended || this.closed) return;
@@ -237,6 +353,9 @@ export class H2Stream implements ProtocolStream {
     takeBody(): Uint8Array | null {
         if (this.bodyOnce !== undefined) return this.bodyOnce;
         this.bodyOnce = mergeChunks(this.chunks);
+        // Handed to the application in one piece: the retained copies are dead weight,
+        // and the buffer budget is free again.
+        this.discardBuffer();
         return this.bodyOnce;
     }
 
@@ -310,10 +429,12 @@ export class H2Stream implements ProtocolStream {
     }
 
     abort(code = 0): void {
+        this.locallyEnded = true;
         this.conn.session.reset(this.id, code);
     }
 
     close(): void {
+        this.locallyEnded = true;
         if (!this.closed) this.conn.session.reset(this.id, 0);
     }
 }
@@ -336,6 +457,8 @@ export class H2Connection implements ProtocolConnection {
         onSettings: null,
     };
     private _closed = false;
+    /** Cleared the first time consume() reports the native session refills windows itself. */
+    private manualWindow = true;
     /** Node-level stream open hook (server). */
     onStreamOpen: ((stream: H2Stream) => void) | null = null;
     /** Client: response headers for a stream. */
@@ -379,9 +502,16 @@ export class H2Connection implements ProtocolConnection {
         sess.ondata = (streamId: number, chunk: Uint8Array, endStream: boolean) => {
             const stream = this.streams.get(streamId);
             if (stream) stream.acceptData(chunk, endStream);
-            // Replenish the receive window once the app has the bytes; without this the
-            // default 65535-byte connection window exhausts and all streams deadlock.
-            if (chunk.byteLength > 0) this.session.consume(streamId, chunk.byteLength);
+            // Replenish the receive window once the app has the bytes. consume() only works
+            // when the native side disabled auto WINDOW_UPDATE; otherwise nghttp2 already
+            // refills and consume() reports invalid state — try once, then stop asking.
+            if (chunk.byteLength > 0 && this.manualWindow) {
+                try {
+                    this.session.consume(streamId, chunk.byteLength);
+                } catch {
+                    this.manualWindow = false;
+                }
+            }
         };
         sess.onheaders = (streamId: number, headers: H2Header[], flags: number) => {
             const stream = this.streams.get(streamId);
@@ -471,6 +601,27 @@ export class H2Connection implements ProtocolConnection {
         }
     }
 
+    /**
+     * RST_STREAM with a named RFC 9113 error code. The code is read from the native
+     * constants table (no cast of the module object) and falls back to the wire value
+     * from the RFC if the table is missing it.
+     */
+    resetStream(streamId: number, code: 'FLOW_CONTROL_ERROR' | 'ENHANCE_YOUR_CALM' | 'CANCEL'): void {
+        const fallback = { FLOW_CONTROL_ERROR: 0x3, ENHANCE_YOUR_CALM: 0xb, CANCEL: 0x8 };
+        let errorCode = fallback[code];
+        try {
+            const known = requireH2().constants[code];
+            if (typeof known === 'number') errorCode = known;
+        } catch {
+            /* extension unavailable; use the RFC value */
+        }
+        try {
+            this.session.reset(streamId, errorCode);
+        } catch {
+            /* session already destroyed */
+        }
+    }
+
     close(): void {
         if (this._closed) return;
         this._closed = true;
@@ -519,6 +670,10 @@ class H2Client implements ProtocolClient {
         return new H2Connection(socket, false, c.secure, {
             maxConcurrentStreams: c.maxConcurrentStreams,
             initialWindowSize: c.initialWindowSize,
+            // Announce a header-list ceiling. Without SETTINGS_MAX_HEADER_LIST_SIZE the
+            // peer may send an arbitrarily large HPACK-decoded header block and nghttp2
+            // has no limit to enforce, so a single response can exhaust memory.
+            maxHeaderListSize: DEFAULT_MAX_HEADER_LIST_SIZE,
         });
     }
 
@@ -561,6 +716,11 @@ class H2Server implements ProtocolServer {
         requireH2();
         return new H2Connection(socket, true, config.secure, {
             maxConcurrentStreams: config.maxConcurrentStreams,
+            // See H2Client.connect: an unset SETTINGS_MAX_HEADER_LIST_SIZE means nghttp2
+            // enforces no bound on a decoded header block. Kept at the http2 default
+            // rather than reusing the H1 maxHeaderSize, whose default (16 KiB) would
+            // reject header blocks Node's http2 server accepts.
+            maxHeaderListSize: DEFAULT_MAX_HEADER_LIST_SIZE,
         });
     }
 

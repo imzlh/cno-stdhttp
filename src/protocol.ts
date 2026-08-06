@@ -149,6 +149,8 @@ export interface ProtocolServerConfig {
     requestTimeout?: number;
     /** Max header count per request. Reject requests with more headers than this. */
     maxHeadersCount?: number;
+    /** Max total bytes for the request head (request line + headers). Node: 16384. */
+    maxHeaderSize?: number;
     /** Max concurrent connections the server accepts. */
     maxConnections?: number;
 }

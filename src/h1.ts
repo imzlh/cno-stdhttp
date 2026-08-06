@@ -32,10 +32,28 @@ import {
     encodeChunkedFrame,
     encodeChunkedTrailer,
     wantsKeepAlive,
+    connectionTokens,
 } from "./h1-frame";
 import { assert } from "../utils/assert";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
+/**
+ * Hard ceiling on request-body bytes held for a server handler that is not draining
+ * them. Mirrors the HTTP/2 cap of the same name in h2.ts so both protocols refuse the
+ * same flood. Reaching this means nothing is consuming the body, so the connection is
+ * failed rather than grown: a handler that *does* drain never gets near it, because
+ * BODY_HIGH_WATER_MARK stops us reading the socket long before.
+ */
+const MAX_BUFFERED_BODY_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Stop reading the socket once this many undelivered body bytes are queued, and resume
+ * at BODY_RESUME_MARK. This is the actual flow control: not reading leaves the bytes in
+ * the kernel receive buffer, which closes the TCP window and makes the peer wait.
+ */
+const BODY_HIGH_WATER_MARK = 1024 * 1024;
+const BODY_RESUME_MARK = 256 * 1024;
 
 function toByteView(buf: CModuleHTTP.BufferSource): Uint8Array {
     if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
@@ -196,7 +214,19 @@ export class HttpResponseParser {
             if (!this.onData) this.bodyChunks.push(view);
             this.onData?.(view);
         };
-        this.parser.onMessageComplete = () => { this.completed = true; this.onComplete?.(); };
+        this.parser.onMessageComplete = () => {
+            // A gzip/deflate body that stops mid-stream decompresses to a short but
+            // otherwise valid-looking result. Validating the trailer here turns silent
+            // truncation into an error, as Node's zlib does.
+            try {
+                this.decompressor?.finish();
+            } catch (err) {
+                const e = err instanceof Error ? err : new Error(String(err));
+                if (this.onError) { this.onError(e); return; }
+                throw e;
+            }
+            this.completed = true; this.onComplete?.();
+        };
     }
 
     feed(data: Uint8Array): CModuleHTTP.ParserExecuteResult | undefined {
@@ -208,6 +238,18 @@ export class HttpResponseParser {
             }
             return result;
         } catch (err) { if (this.onError) this.onError(err as Error); else throw err; }
+    }
+
+    /**
+     * Signal EOF. A response with neither Content-Length nor chunked encoding is
+     * terminated by the close itself, so llhttp only completes such a message once
+     * told the stream ended. Leaves `isCompleted` false when EOF truncated a framed
+     * body, so the caller can treat that as the error it is.
+     */
+    finishOnEof(): void {
+        try {
+            this.parser.finish();
+        } catch { /* llhttp rejected the EOF state; isCompleted stays false */ }
     }
 
     getStatusCode(): number { assert(this.statusCode, "Response not completed"); return this.statusCode; }
@@ -272,6 +314,10 @@ export class H1ServerConnection implements ProtocolConnection {
     /** Idle keep-alive timeout (ms); Node emits Keep-Alive: timeout=<sec> from this. */
     private keepAliveTimeoutMs: number;
     private maxHeadersCount: number;
+    /** Byte budget for the whole head (request line + field names + values). */
+    private maxHeaderSize: number;
+    /** Head bytes seen so far this request; compared against maxHeaderSize incrementally. */
+    private headerBytes = 0;
     private parser: CModuleHTTP.Parser;
     private method = ''; private url = ''; private reqHeaders: Array<[string, string]> = [];
     private headerField = ''; private headersOk = false;
@@ -280,6 +326,16 @@ export class H1ServerConnection implements ProtocolConnection {
     private headersSent = false; private responseEnded = false; private chunkedEncoding = false;
     /** Response has explicit framing (chunked, content-length, or bodyless status/HEAD). */
     private responseFramed = false;
+    /** RFC 9112 §6.3: HEAD / 1xx / 204 / 304 end at the header block — no body bytes at all. */
+    private bodyless = false;
+    /** Header-block fault (oversized headers, bad framing) — answer 400, never run the handler. */
+    private requestError: Error | null = null;
+    /** Status to answer a rejected header block with (431 for an oversized head). */
+    private requestErrorStatus = 400;
+    /** Chunked trailer fields; kept out of reqHeaders so they cannot forge request headers. */
+    private trailers: Array<[string, string]> = [];
+    /** Server loop said this is the last request — response must announce Connection: close. */
+    private forceClose = false;
     private compressEncoding: 'gzip' | 'deflate' | null = null;
     private compressor: StreamingCompressor | null = null;
     private requestCount = 0; private keepAlive = true; private requestHttpVersion = '1.1';
@@ -289,17 +345,24 @@ export class H1ServerConnection implements ProtocolConnection {
     private pendingInput: Uint8Array | null = null;
     private events: ProtocolConnectionEvents = { onstream: null, onError: null, onClose: null, onGoaway: null, onSettings: null };
     private bodyChunk: Uint8Array[] = [];
+    /** Undelivered bytes sitting in bodyChunk; drives backpressure and the hard cap. */
+    private bufferedBody = 0;
+    /** True once the handler has polled req.body() at least once — i.e. a real consumer exists. */
+    private bodyPolled = false;
+    /** Resolved when the queue drains below BODY_RESUME_MARK, so the read loop can continue. */
+    private drainWaiter: PromiseWithResolvers<void> | null = null;
     private pendingPromise: PromiseWithResolvers<Uint8Array | null> | null = null;
     private bodyError: Error | null = null;
     /** Peer/transport fault observed on read — writers must see the same coded error. */
     private transportError: Error | null = null;
     private ended = false;
 
-    constructor(socket: TcpSocket, secure: boolean, keepAliveTimeoutMs = 5000, maxHeadersCount: number = 2000) {
+    constructor(socket: TcpSocket, secure: boolean, keepAliveTimeoutMs = 5000, maxHeadersCount: number = 2000, maxHeaderSize: number = 16384) {
         this.socket = socket;
         this.secure = secure;
         this.keepAliveTimeoutMs = keepAliveTimeoutMs;
         this.maxHeadersCount = maxHeadersCount;
+        this.maxHeaderSize = maxHeaderSize;
         this.parser = new http.Parser(http.REQUEST);
         this.setupParser();
     }
@@ -324,13 +387,36 @@ export class H1ServerConnection implements ProtocolConnection {
         if (pending) {
             this.pendingPromise = null;
             pending.resolve(u8);
-        } else {
-            this.bodyChunk.push(u8);
+            return;
         }
+        // Nobody is waiting: the bytes are retained, so they must be accounted for.
+        // Without this counter the queue is a plain unbounded array and a peer that
+        // sends a body no handler reads grows RSS one-for-one with what it sends.
+        this.bodyChunk.push(u8);
+        this.bufferedBody += u8.byteLength;
+    }
+
+    /** Let the read loop continue once the consumer has taken enough out of the queue. */
+    private wakeDrain(): void {
+        const w = this.drainWaiter;
+        if (w && this.bufferedBody <= BODY_RESUME_MARK) {
+            this.drainWaiter = null;
+            w.resolve();
+        }
+    }
+
+    /** Release retained body bytes; the body is being failed and nothing will read them. */
+    private discardBody(): void {
+        this.bodyChunk = [];
+        this.bufferedBody = 0;
+        const w = this.drainWaiter;
+        if (w) { this.drainWaiter = null; w.resolve(); }
     }
 
     private finishBody(): void {
         this.ended = true;
+        const w = this.drainWaiter;
+        if (w) { this.drainWaiter = null; w.resolve(); }
         const pending = this.pendingPromise;
         if (pending) {
             this.pendingPromise = null;
@@ -340,14 +426,28 @@ export class H1ServerConnection implements ProtocolConnection {
 
     private failBody(err: Error): void {
         this.markTransportError(err);
-        // Peer gone: end the body stream (resolve null). Rejecting would race the
-        // pump and surface as unhandled rejection when no body consumer is attached.
-        if (TcpSocket.isDisconnectError(err)) {
+        // Peer gone: end the body stream (resolve null) only if the body had actually
+        // reached its declared end. Resolving null on a body that is still short would
+        // report a clean EOF, making a truncated upload indistinguishable from a whole
+        // one — Node marks req.complete=false and emits 'aborted'/ECONNRESET here, and a
+        // handler that commits on end-of-body would otherwise store a partial object.
+        if (TcpSocket.isDisconnectError(err) && !this.bodyIncomplete()) {
+            this.discardBody();
             this.finishBody();
             return;
         }
+        if (TcpSocket.isDisconnectError(err)) {
+            // Surface truncation as a coded error. Setting bodyError alone cannot raise an
+            // unhandled rejection: a pendingPromise only exists because req.body() created
+            // it for a caller that is awaiting it, and with no caller nothing is rejected.
+            err = Object.assign(
+                new Error('request body truncated: peer closed before the declared body length'),
+                { code: 'ECONNRESET' },
+            );
+        }
         this.bodyError = err;
         this.ended = true;
+        this.discardBody();
         const pending = this.pendingPromise;
         if (pending) {
             this.pendingPromise = null;
@@ -355,25 +455,86 @@ export class H1ServerConnection implements ProtocolConnection {
         }
     }
 
+    /**
+     * Did the body stop short of what the framing promised? Only meaningful while the
+     * message is unfinished — onMessageComplete calls finishBody(), not failBody().
+     */
+    private bodyIncomplete(): boolean {
+        if (!this.expectBody) return false;
+        // Chunked declares its end with a 0-chunk; not having seen one means short.
+        if (this.chunked) return true;
+        return this.bodyRead < this.contentLength;
+    }
+
+    /** Bad header block: stop parsing here so the handler never sees the request. */
+    private rejectHeaders(err: Error, status = 400): void {
+        if (!this.requestError) { this.requestError = err; this.requestErrorStatus = status; }
+        this.parser.pause();
+    }
+
+    /**
+     * Charge `n` bytes of head (request line, field name, or value) against the
+     * budget. Without this a peer can stream an endless header block: llhttp has
+     * no size limit of its own and maxHeadersCount is only checked at
+     * onHeadersComplete, which such a peer never reaches — so reqHeaders/url grow
+     * until the process dies. Node caps the same total at http.maxHeaderSize
+     * (16384) and answers 431.
+     */
+    private chargeHeaderBytes(n: number): boolean {
+        if (this.maxHeaderSize <= 0) return true;
+        this.headerBytes += n;
+        if (this.headerBytes <= this.maxHeaderSize) return true;
+        this.rejectHeaders(
+            new Error(`request head exceeds ${this.maxHeaderSize} bytes`),
+            431,
+        );
+        return false;
+    }
+
+    /** Minimal close-delimited error response for a rejected header block. */
+    private async rejectRequest(status: number, statusText: string): Promise<void> {
+        this.keepAlive = false;
+        this.responseFramed = true;
+        try {
+            await this.socket.write(encodeResponseHead(this.requestHttpVersion, status, statusText, [
+                ['Content-Length', '0'],
+                ['Connection', 'close'],
+            ]));
+        } catch { /* peer already gone */ }
+        this.headersSent = true;
+        this.responseEnded = true;
+    }
+
     private setupParser(): void {
-        this.parser.onUrl = (buf, off, len) => { this.url += decodeParserBytes(buf, off, len); };
-        this.parser.onHeaderField = (buf, off, len) => { this.headerField = decodeParserBytes(buf, off, len).toLowerCase(); };
+        this.parser.onUrl = (buf, off, len) => {
+            // The request target counts toward the head budget (Node: a 30k URL is
+            // HPE_HEADER_OVERFLOW), and is what an attacker grows when sending no headers.
+            if (!this.chargeHeaderBytes(len)) return;
+            this.url += decodeParserBytes(buf, off, len);
+        };
+        this.parser.onHeaderField = (buf, off, len) => {
+            if (!this.chargeHeaderBytes(len)) return;
+            this.headerField = decodeParserBytes(buf, off, len).toLowerCase();
+        };
         this.parser.onHeaderValue = (buf, off, len) => {
+            if (!this.chargeHeaderBytes(len)) return;
             const name = this.headerField.toLowerCase();
             const value = decodeParserBytes(buf, off, len);
             validateHeader(name, value);
-            this.reqHeaders.push([name, value]);
+            // Fields after the header block are chunked trailers — never request headers.
+            if (this.headersOk) this.trailers.push([name, value]);
+            else this.reqHeaders.push([name, value]);
         };
         this.parser.onHeadersComplete = () => {
             this.method = HTTP_METHODS[this.parser.state.method] ?? 'UNKNOWN'; this.headersOk = true;
             if (this.maxHeadersCount > 0 && this.reqHeaders.length > this.maxHeadersCount) {
-                this.failBody(new Error(`request exceeds max headers (${this.maxHeadersCount})`));
+                this.rejectHeaders(new Error(`request exceeds max headers (${this.maxHeadersCount})`));
                 return;
             }
             const connH = this.reqHeaders.find(([n]) => n === 'connection')?.[1];
             const ver = `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`;
             this.requestHttpVersion = ver;
-            this.keepAlive = wantsKeepAlive(ver, connH);
+            this.keepAlive = wantsKeepAlive(ver, connH) && !this.forceClose;
             const ae = this.reqHeaders.find(([n]) => n === 'accept-encoding')?.[1];
             if (ae) this.compressEncoding = pickEncoding(parseAcceptEncoding(ae));
             const cl = this.reqHeaders.find(([n]) => n === 'content-length')?.[1];
@@ -383,13 +544,37 @@ export class H1ServerConnection implements ProtocolConnection {
                 this.chunked = true; this.expectBody = true;
             } else if (cl) {
                 const len = parseContentLength(cl, this.reqHeaders);
-                if (len < 0) { this.failBody(new Error('invalid Content-Length')); return; }
+                if (len < 0) { this.rejectHeaders(new Error('invalid Content-Length')); return; }
                 this.contentLength = len; this.expectBody = len > 0;
             }
         };
         this.parser.onBody = (buf, off, len) => {
-            const u8 = toByteView(buf).subarray(off, off + len);
+            // Already failed: nothing will read these bytes, so retaining them only
+            // re-grows a queue we just discarded (same reasoning as h2.acceptData).
+            if (this.bodyError || this._closed) return;
+            // slice(), not subarray(): a view keeps its whole parent read buffer alive,
+            // so the retained total would exceed what bufferedBody counts and the cap
+            // would under-measure real memory.
+            const u8 = toByteView(buf).slice(off, off + len);
+            // Counts what the framing actually delivered, so a peer that vanishes short of
+            // Content-Length can be told apart from one that finished (see bodyIncomplete).
+            this.bodyRead += len;
             this.enqueue(u8);
+            if (this.bufferedBody > MAX_BUFFERED_BODY_BYTES) {
+                // Reached only when no consumer is draining — backpressure caps a real
+                // consumer at BODY_HIGH_WATER_MARK, far below this. Fail the body and drop
+                // keep-alive; growing further is how a single request exhausts the process.
+                this.discardBody();
+                this.bodyError = Object.assign(
+                    new Error(`request body exceeds ${MAX_BUFFERED_BODY_BYTES} buffered bytes`),
+                    { code: 'ERR_HTTP_REQUEST_BODY_TOO_LARGE' },
+                );
+                this.ended = true;
+                this.keepAlive = false;
+                const pending = this.pendingPromise;
+                if (pending) { this.pendingPromise = null; pending.reject(this.bodyError); }
+                this.parser.pause();
+            }
         }
         this.parser.onMessageComplete = () => {
             this.finishBody();
@@ -403,7 +588,12 @@ export class H1ServerConnection implements ProtocolConnection {
         this.headersSent = false; this.responseEnded = false; this.responseFramed = false;
         this.chunkedEncoding = false; this.compressEncoding = null; this.compressor = null;
         this.requestHttpVersion = '1.1';
+        this.bodyless = false; this.requestError = null; this.requestErrorStatus = 400; this.trailers = [];
+        this.headerBytes = 0;
         this.bodyChunk = [];
+        this.bufferedBody = 0;
+        this.bodyPolled = false;
+        this.drainWaiter = null;
         this.pendingPromise = null;
         this.bodyError = null;
         this.transportError = null;
@@ -421,6 +611,16 @@ export class H1ServerConnection implements ProtocolConnection {
         let handlerStarted = false;
 
         while (!this.ended) {
+            // Flow control: a consumer that has fallen behind must not be raced. Leaving
+            // the bytes in the kernel receive buffer closes the TCP window, so the peer
+            // slows down instead of us growing the queue. Gated on bodyPolled so a handler
+            // that never reads the body cannot deadlock the loop — that case is bounded by
+            // MAX_BUFFERED_BODY_BYTES in onBody instead.
+            if (this.bodyPolled && this.bufferedBody >= BODY_HIGH_WATER_MARK && !this.ended) {
+                if (!this.drainWaiter) this.drainWaiter = Promise.withResolvers<void>();
+                await this.drainWaiter.promise;
+                if (this.ended) break;
+            }
             let data = this.pendingInput;
             this.pendingInput = null;
             if (data === null) {
@@ -448,6 +648,24 @@ export class H1ServerConnection implements ProtocolConnection {
 
             const r = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
 
+            // Bad header block (oversized head, too many headers, malformed
+            // Content-Length): answer 400/431 and drop the connection. The handler must
+            // never run, or a request the parser refused to frame would still be served.
+            if (this.requestError && !handlerStarted) {
+                this.finishBody();
+                const status = this.requestErrorStatus;
+                await this.rejectRequest(status, status === 431 ? 'Request Header Fields Too Large' : 'Bad Request');
+                return false;
+            }
+            // Same fault raised while parsing trailers: the handler is already running and
+            // may be awaiting the body. rejectHeaders() paused the parser, so
+            // onMessageComplete will never arrive — fail the body or the handler hangs
+            // forever on a promise nothing will ever resolve.
+            if (this.requestError && handlerStarted && !this.ended) {
+                this.failBody(this.requestError);
+                this.keepAlive = false;
+            }
+
             // Start the handler as soon as headers are parsed. This must run
             // before the HPE_PAUSED break below: when the whole request arrives
             // in one buffer, onMessageComplete pauses the parser mid-execute,
@@ -461,9 +679,17 @@ export class H1ServerConnection implements ProtocolConnection {
                 req.httpVersion = this.requestHttpVersion;
                 if (this.expectBody) {
                     req.body = () => {
+                        // A poll proves a consumer exists, which is what licenses the read
+                        // loop to block on backpressure instead of buffering without limit.
+                        this.bodyPolled = true;
                         if (this.bodyChunk.length) {
                             const chunk = this.bodyChunk.shift();
-                            if (chunk !== undefined) return Promise.resolve(chunk);
+                            if (chunk !== undefined) {
+                                this.bufferedBody -= chunk.byteLength;
+                                if (this.bufferedBody < 0) this.bufferedBody = 0;
+                                this.wakeDrain();
+                                return Promise.resolve(chunk);
+                            }
                         }
                         if (this.bodyError) return Promise.reject(this.bodyError);
                         if (this.ended) return Promise.resolve(null);
@@ -500,8 +726,15 @@ export class H1ServerConnection implements ProtocolConnection {
                     this.keepAlive = false;
                     break;
                 }
-                this.failBody(new Error(`Parse error: ${r.reason}`));
-                throw new Error(`Parse error: ${r.reason}`);
+                const parseError = new Error(`Parse error: ${r.reason}`);
+                this.failBody(parseError);
+                // The handler is already running and awaiting the body we just failed;
+                // nothing awaits its promise after we throw, so absorb that rejection here.
+                if (handlePromise) handlePromise.catch(() => { /* reported via body error */ });
+                // Malformed framing before any handler ran: answer 400 so the peer sees a
+                // status, not a bare FIN (llhttp rejects bad CL/TE before onHeadersComplete).
+                else await this.rejectRequest(400, 'Bad Request');
+                throw parseError;
             }
         }
 
@@ -516,11 +749,18 @@ export class H1ServerConnection implements ProtocolConnection {
         this.throwIfTransportDead();
         if (this.headersSent) throw new Error("Headers already sent");
         if (this.responseEnded) throw new Error("Response already ended");
+        // Work on our own copy: the filters/pushes below would otherwise mutate the
+        // handler's array, so a handler that reuses its header list on the next
+        // request would silently inherit content-encoding/transfer-encoding from this one.
+        headers = headers.map(([n, v]) => [n, v] as [string, string]);
         const headerValue = (name: string): string | undefined =>
             headers.find(([n]) => n.toLowerCase() === name)?.[1];
         const hasHeader = (name: string): boolean =>
             headers.some(([n]) => n.toLowerCase() === name);
         const isBodyForbiddenStatus = (status >= 100 && status < 200) || status === 204 || status === 304;
+        // RFC 9112 §6.3: a HEAD response also ends at the header block. Headers stay as the
+        // handler set them (HEAD must mirror GET), but no body byte may ever be written.
+        this.bodyless = isBodyForbiddenStatus || this.method === 'HEAD';
         if (isBodyForbiddenStatus) {
             headers = headers.filter(([n]) => {
                 const key = n.toLowerCase();
@@ -532,7 +772,13 @@ export class H1ServerConnection implements ProtocolConnection {
         }
         const te = headerValue('transfer-encoding');
         if (te?.toLowerCase().includes('chunked')) this.chunkedEncoding = true;
-        if (!isBodyForbiddenStatus && this.compressEncoding && !hasHeader('content-encoding') && !this.chunkedEncoding) {
+        // A handler-supplied `Connection: close` is binding on us too. Without this the
+        // wire says close while the server keeps looping for another request on a socket
+        // the peer has stopped using — the connection lingers until the idle timer fires.
+        if (connectionTokens(headerValue('connection')).includes('close')) this.keepAlive = false;
+        // Never negotiate compression for a bodyless response: the gzip trailer and the
+        // terminating chunk would be read by the peer as the start of the next response.
+        if (!this.bodyless && this.compressEncoding && !hasHeader('content-encoding') && !this.chunkedEncoding) {
             const ct = headerValue('content-type');
             if (!ct || shouldCompress(ct)) {
                 this.compressor = new StreamingCompressor(this.compressEncoding);
@@ -550,10 +796,18 @@ export class H1ServerConnection implements ProtocolConnection {
             else this.chunkedEncoding = true;
         }
         this.responseFramed = !needsFraming || this.chunkedEncoding;
-        const outHeaders = headers.slice();
+        if (this.forceClose) this.keepAlive = false;
+        let outHeaders = headers.slice();
         if (needsFraming && this.chunkedEncoding) outHeaders.push(['transfer-encoding', 'chunked']);
         if (!hasHeader('connection')) {
             outHeaders.push(['Connection', this.keepAlive ? 'keep-alive' : 'close']);
+        } else if (!this.keepAlive) {
+            // The handler asked for keep-alive but this connection will not be reused
+            // (1.0 close-delimited body, maxRequestsPerConnection reached, upgrade).
+            // Advertising reuse we then refuse desyncs the peer: it pipelines a second
+            // request into a socket we close, or waits forever for a body terminator.
+            outHeaders = outHeaders.filter(([n]) => n.toLowerCase() !== 'connection');
+            outHeaders.push(['Connection', 'close']);
         }
         // Node adds Keep-Alive: timeout=<sec> when the connection stays open.
         if (this.keepAlive && !hasHeader('keep-alive') && this.keepAliveTimeoutMs > 0) {
@@ -574,6 +828,9 @@ export class H1ServerConnection implements ProtocolConnection {
         this.throwIfTransportDead();
         if (this.responseEnded) throw new Error("Response already ended");
         if (!this.headersSent) { if (this.requestHttpVersion === "1.0") { this.keepAlive = false; await this.writeHead(200, "OK", []); } else { this.chunkedEncoding = true; await this.writeHead(200, "OK", [['transfer-encoding', 'chunked']]); } }
+        // Bodyless response: the peer stopped reading at the header block, so any byte
+        // written here would be parsed as the head of the next response (Node drops too).
+        if (this.bodyless) return;
         let data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
         if (this.compressor) data = this.compressor.compress(data);
         try {
@@ -592,18 +849,22 @@ export class H1ServerConnection implements ProtocolConnection {
         if (chunk !== undefined) await this.writeData(chunk);
         else if (!this.headersSent) await this.writeHead(200, "OK", [['content-length', '0']]);
         try {
-            if (this.compressor) {
-                const tail = this.compressor.finish();
-                if (tail.length > 0 && this.chunkedEncoding) {
-                    await this.socket.write(encodeChunkedFrame(tail));
+            // Bodyless: nothing follows the header block — no compressor tail, no `0\r\n\r\n`.
+            if (this.bodyless) this.chunkedEncoding = false;
+            else {
+                if (this.compressor) {
+                    const tail = this.compressor.finish();
+                    if (tail.length > 0 && this.chunkedEncoding) {
+                        await this.socket.write(encodeChunkedFrame(tail));
+                    }
                 }
+                if (this.chunkedEncoding) {
+                    await this.socket.write(encodeChunkedTrailer());
+                    this.chunkedEncoding = false;
+                }
+                // Unframed body (1.0 / handler-supplied TE): EOF is the only terminator.
+                else if (!this.responseFramed) this.keepAlive = false;
             }
-            if (this.chunkedEncoding) {
-                await this.socket.write(encodeChunkedTrailer());
-                this.chunkedEncoding = false;
-            }
-            // Unframed body (1.0 / handler-supplied TE): EOF is the only terminator.
-            else if (!this.responseFramed) this.keepAlive = false;
         } catch (err) {
             const e = err instanceof Error ? err : new Error(String(err));
             this.markTransportError(e);
@@ -627,6 +888,8 @@ export class H1ServerConnection implements ProtocolConnection {
         this.events.onClose?.();
     }
     destroy(): void { this.close(); }
+    /** Last request on this connection: the response must carry Connection: close. */
+    disableKeepAlive(): void { this.forceClose = true; this.keepAlive = false; }
     markUpgraded(): void { this._upgraded = true; this.keepAlive = false; }
     get isUpgraded(): boolean { return this._upgraded; }
     takeUpgradeLeftover(): Uint8Array | null { const v = this.upgradeLeftover; this.upgradeLeftover = null; return v; }
@@ -649,11 +912,7 @@ class H1ClientConnection implements ProtocolConnection {
     async sendRequest(req: HttpRequestBuilder): Promise<RawResponse> {
         await this.socket.write(req.build());
         this.parser = new HttpResponseParser();
-        let status = 0; const headers: Array<[string, string]> = []; const chunks: Uint8Array[] = [];
-        this.parser.onHeadersComplete = (code, hdrs) => { status = code; headers.push(...hdrs); };
-        this.parser.onData = (chunk) => chunks.push(chunk);
-        while (!this.parser.isCompleted) { const d = await this.socket.read(); if (!d) break; this.parser.feed(d); }
-        return { status, statusText: strstatus(status), headers, body: mergeChunks(chunks) };
+        return this.driveParser(this.parser);
     }
     receive(_d: Uint8Array): void { }
     wantWrite(): boolean { return false; }
@@ -666,10 +925,30 @@ class H1ClientConnection implements ProtocolConnection {
     async readResponse(): Promise<RawResponse> {
         // Drive the parser until the response is complete.
         if (!this.parser) this.parser = new HttpResponseParser();
+        return this.driveParser(this.parser);
+    }
+
+    /**
+     * Read until the response is complete. An EOF before completion is an error,
+     * not an empty result: returning `{status: 0, body: <partial>}` hands the caller
+     * a truncated body that looks like a successful short response. Node surfaces
+     * the same condition as ECONNRESET / "socket hang up".
+     */
+    private async driveParser(parser: HttpResponseParser): Promise<RawResponse> {
         let status = 0; const headers: Array<[string, string]> = []; const chunks: Uint8Array[] = [];
-        this.parser.onHeadersComplete = (code, hdrs) => { status = code; headers.push(...hdrs); };
-        this.parser.onData = (chunk) => chunks.push(chunk);
-        while (!this.parser.isCompleted) { const d = await this.socket.read(); if (!d) break; this.parser.feed(d); }
+        parser.onHeadersComplete = (code, hdrs) => { status = code; headers.push(...hdrs); };
+        parser.onData = (chunk) => chunks.push(chunk);
+        while (!parser.isCompleted) {
+            const d = await this.socket.read();
+            if (!d) {
+                // A close-delimited response (no CL, no chunked) legitimately ends at EOF:
+                // tell llhttp so it can complete the message before we judge it.
+                parser.finishOnEof();
+                if (parser.isCompleted) break;
+                throw error.Error(error.errno.ECONNRESET);
+            }
+            parser.feed(d);
+        }
         return { status, statusText: strstatus(status), headers, body: mergeChunks(chunks) };
     }
     async writeRequest(data: Uint8Array): Promise<void> { await this.socket.write(data); }
@@ -692,7 +971,7 @@ class H1Client implements ProtocolClient {
 class H1Server implements ProtocolServer {
     readonly version = HttpVersion.HTTP11;
     async accept(socket: TcpSocket, config: ProtocolServerConfig): Promise<ProtocolConnection> {
-        return new H1ServerConnection(socket, config.secure, config.keepAliveTimeout, config.maxHeadersCount);
+        return new H1ServerConnection(socket, config.secure, config.keepAliveTimeout, config.maxHeadersCount, config.maxHeaderSize);
     }
     negotiate(alpn?: string): HttpVersion | null { return (!alpn || alpn === ALPN.HTTP11 || alpn === ALPN.HTTP10) ? HttpVersion.HTTP11 : null; }
 }

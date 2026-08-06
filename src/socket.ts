@@ -11,11 +11,25 @@
 const streams = import.meta.use("streams");
 const ssl = import.meta.use("ssl");
 const error = import.meta.use("error");
+const timers = import.meta.use("timers");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 const READ_SIZE = 16384;
 const MAX_WRITE_STALLS = 16;
+/**
+ * Hard ceiling on how long one `write()` may sit in the SSL stall path waiting for
+ * the peer to move cipher. Bounds the whole stall sequence, not each wait, so a
+ * dribbling peer cannot hold a write for MAX_WRITE_STALLS * timeout.
+ */
+const WRITE_STALL_TIMEOUT_MS = 10_000;
+/**
+ * Cap on how long a TLS handshake may take. A peer that connects and then sends
+ * nothing (or dribbles bytes) otherwise parks an fd, a libuv read request and this
+ * promise forever: the server's request timeout only starts once the handshake is
+ * done, so a slow handshake is a free slowloris.
+ */
+const HANDSHAKE_TIMEOUT_MS = 30_000;
 
 export interface ISocket {
     onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
@@ -66,10 +80,11 @@ export class TcpSocket implements ISocket {
                 if (err) {
                     this._readErrHandler?.(err);
                     Reflect.set(this.socket, 'onread', null);
+                    this.notifyInput();   // a write stalled on input must not wait out its deadline
                 }
                 return;
             }
-            if (data === null) { this._readCallback?.(null); return; }
+            if (data === null) { this.notifyInput(); this._readCallback?.(null); return; }
             // TLS: decrypt cipher before delivering (same path as read()).
             if (this.sslPipe) {
                 try {
@@ -82,10 +97,17 @@ export class TcpSocket implements ISocket {
                         this.pending = null;
                     }
                     const consumed = this.feedCipher(cipher);
-                    if (consumed < cipher.length) this.pending = cipher.subarray(consumed);
+                    this.pending = consumed < cipher.length ? cipher.subarray(consumed) : null;
                     this.sslPipe.handshake();
+                    this.notifyInput();   // cipher reached the engine: a stalled SSL_write may proceed
                     const out = this.sslPipe.getOutput();
-                    if (out) void this.socket.write(new Uint8Array(out));
+                    // Renegotiation output is fire-and-forget here; a rejected write must
+                    // reach the error handler instead of surfacing as an unhandled rejection.
+                    if (out) {
+                        this.socket.write(new Uint8Array(out)).catch((e: unknown) => {
+                            this._readErrHandler?.(e instanceof Error ? e : new Error(String(e)));
+                        });
+                    }
                     // Flush all available plaintext to the callback.
                     while (this._readCallback) {
                         const plain = this.sslRead(READ_SIZE);
@@ -93,6 +115,7 @@ export class TcpSocket implements ISocket {
                         this._readCallback(plain);
                     }
                 } catch (e) {
+                    this.notifyInput();
                     this._readErrHandler?.(e instanceof Error ? e : new Error(String(e)));
                     return;
                 }
@@ -140,13 +163,23 @@ export class TcpSocket implements ISocket {
         while (true) {
             const n = await this.readRaw(buf);
             if (n === 0) return null; // EOF
-            const cipher = buf.subarray(0, n);
+            let cipher = buf.subarray(0, n);
+            // Cipher the BIO refused earlier must go back in front, or the TLS record
+            // stream is reordered and every later record fails to decrypt.
+            if (this.pending) {
+                const joined = new Uint8Array(this.pending.length + cipher.length);
+                joined.set(this.pending);
+                joined.set(cipher, this.pending.length);
+                cipher = joined;
+                this.pending = null;
+            }
             const consumed = this.feedCipher(cipher);
-            if (consumed < cipher.length) this.pending = cipher.subarray(consumed);
+            this.pending = consumed < cipher.length ? cipher.subarray(consumed) : null;
             // Drive SSL state machine (handles renegotiation), then flush any output
             const sslPipe = this.sslPipe;
             if (!sslPipe) return null;
             sslPipe.handshake();
+            this.notifyInput();   // cipher reached the engine: a stalled SSL_write may proceed
             const out = sslPipe.getOutput();
             if (out) await this.socket.write(new Uint8Array(out));
             const plain = this.sslRead(size);
@@ -155,26 +188,115 @@ export class TcpSocket implements ISocket {
         }
     }
 
-    /** Write plaintext to socket (SSL-aware). */
-    async write(data: Uint8Array): Promise<void> {
+    /**
+     * Write plaintext to socket (SSL-aware).
+     *
+     * Serialised per socket: the TLS path interleaves `sslPipe.write` and
+     * `flushOutput` across awaits, so two concurrent writers would emit each
+     * other's records out of order and the peer would fail to decrypt. Plain TCP
+     * writers would likewise interleave and corrupt the body framing.
+     */
+    write(data: Uint8Array): Promise<void> {
+        const run = this.writeQueue.then(
+            () => this.writeLocked(data),
+            () => this.writeLocked(data),   // a previous write's failure must not block ours
+        );
+        // Keep the chain alive and unrejected; each caller still sees its own error.
+        this.writeQueue = run.catch(() => { /* reported to the caller of that write */ });
+        return run;
+    }
+
+    private writeQueue: Promise<void> = Promise.resolve();
+
+    private async writeLocked(data: Uint8Array): Promise<void> {
         if (data.length === 0) return;
         if (!this.sslPipe) { await this.socket.write(data); return; }
 
         let offset = 0;
         let stalls = 0;
+        let deadline = 0;
         while (offset < data.length) {
-            const written = this.sslPipe.write(data.subarray(offset));
-            if (written < 0) throw new Error(`SSL_write failed: ${written}`);
-            if (written === 0) {
+            // close() nulls sslPipe. A write that resumed here after that would fall
+            // through to the plaintext branch on the next call and put cleartext on the
+            // wire, so treat a vanished pipe as the disconnect it is.
+            const sslPipe = this.sslPipe;
+            if (!sslPipe) throw Object.assign(new Error('SSL_write failed: socket closed'), { code: 'ECONNRESET' });
+
+            const written = sslPipe.write(data.subarray(offset));
+            // SSL_write signals WANT_READ/WANT_WRITE by returning *null*, not 0 (see
+            // CHECK_SSL_ERR in mod_ssl.c). `null === 0` is false and `offset += null`
+            // leaves offset untouched, so the old code span this loop forever with no
+            // await in it: one socket wedged the entire event loop at 100% CPU. Normalise
+            // to a number before any comparison.
+            const n = typeof written === 'number' ? written : 0;
+            if (n < 0) throw new Error(`SSL_write failed: ${n}`);
+            if (n === 0) {
                 // SSL must flush output or consume input before accepting more plaintext.
                 if (++stalls > MAX_WRITE_STALLS) throw new Error(`SSL_write failed: no progress after ${stalls} attempts`);
-                if (!await this.flushOutput()) await this.pumpInput();
+                if (deadline === 0) deadline = Date.now() + WRITE_STALL_TIMEOUT_MS;
+                await this.makeWriteProgress(deadline);
                 continue;
             }
             stalls = 0;
-            offset += written;
+            deadline = 0;
+            offset += n;
         }
         await this.flushOutput();
+    }
+
+    /**
+     * Unblock a stalled SSL_write.
+     *
+     * Flushing pending cipher out is always safe. Pulling fresh cipher *in* is not:
+     * `socket.read()` throws "startRead already in progress" whenever a callback reader
+     * (onReadable) or a handshake loop already owns the read, which is every server
+     * connection. So issue our own read only when nothing else is reading, and otherwise
+     * wait for whoever is — they call notifyInput() once cipher reaches the engine.
+     */
+    private async makeWriteProgress(deadline: number): Promise<void> {
+        if (await this.flushOutput()) return;
+        if (this._readCallback || this._readInFlight || this._handshaking) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0 || !await this.waitForInput(remaining)) {
+                throw Object.assign(new Error('SSL_write stalled: no cipher from peer'), { code: 'ETIMEDOUT' });
+            }
+            return;
+        }
+        await this.pumpInput();
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Input arrival signal (couples the read paths to writeLocked)   */
+    /* -------------------------------------------------------------- */
+
+    private _inputWaiters: Array<() => void> = [];
+    private _readInFlight = false;
+    private _handshaking = false;
+
+    /** Wake writes stalled in makeWriteProgress. Must also run on EOF/error/close. */
+    private notifyInput(): void {
+        if (this._inputWaiters.length === 0) return;
+        const waiters = this._inputWaiters;
+        this._inputWaiters = [];
+        for (const w of waiters) w();
+    }
+
+    /** Resolves true if cipher arrived, false if `ms` elapsed first. */
+    private waitForInput(ms: number): Promise<boolean> {
+        return new Promise<boolean>((resolve) => {
+            let done = false;
+            const tid = timers.setTimeout(() => {
+                if (done) return;
+                done = true;
+                resolve(false);
+            }, ms);
+            this._inputWaiters.push(() => {
+                if (done) return;
+                done = true;
+                timers.clearTimeout(tid);
+                resolve(true);
+            });
+        });
     }
 
     /* -------------------------------------------------------------- */
@@ -184,43 +306,73 @@ export class TcpSocket implements ISocket {
     /** Server-side TLS handshake. */
     async serverHandshake(ctx: CModuleSSL.Context): Promise<void> {
         this.sslPipe = new ssl.Pipe(ctx);
-        const buf = new Uint8Array(READ_SIZE);
-        while (!this.sslPipe.handshakeComplete) {
-            const n = await this.readRaw(buf);
-            if (n === 0) throw new Error("SSL handshake failed: connection closed");
-            let toFeed = buf.subarray(0, n);
-            while (toFeed.length > 0) {
-                const c = this.feedCipher(toFeed);
-                if (c <= 0) throw new Error(`SSL feed failed during handshake: consumed=${c}`);
-                toFeed = c < toFeed.length ? toFeed.subarray(c) : new Uint8Array(0);
+        const deadline = this.startHandshakeDeadline();
+        this._handshaking = true;
+        try {
+            const buf = new Uint8Array(READ_SIZE);
+            while (!this.sslPipe.handshakeComplete) {
+                const n = await this.readRaw(buf);
+                if (n === 0) throw new Error("SSL handshake failed: connection closed");
+                let toFeed = buf.subarray(0, n);
+                while (toFeed.length > 0) {
+                    const c = this.feedCipher(toFeed);
+                    if (c <= 0) throw new Error(`SSL feed failed during handshake: consumed=${c}`);
+                    toFeed = c < toFeed.length ? toFeed.subarray(c) : new Uint8Array(0);
+                }
+                this.sslPipe.handshake();
+                this.notifyInput();   // lets a write issued during the handshake retry SSL_write
+                const out = this.sslPipe.getOutput();
+                if (out) await this.socket.write(new Uint8Array(out));
             }
-            this.sslPipe.handshake();
-            const out = this.sslPipe.getOutput();
-            if (out) await this.socket.write(new Uint8Array(out));
+        } finally {
+            this._handshaking = false;
+            this.notifyInput();
+            deadline();
         }
     }
 
     /** Client-side TLS handshake. */
     async clientHandshake(ctx: CModuleSSL.Context, servername?: string): Promise<void> {
         this.sslPipe = new ssl.Pipe(ctx, servername ? { servername } : undefined);
-        this.sslPipe.handshake();
-        const initial = this.sslPipe.getOutput();
-        if (initial) await this.socket.write(new Uint8Array(initial));
-
-        const buf = new Uint8Array(READ_SIZE);
-        while (!this.sslPipe.handshakeComplete) {
-            const n = await this.readRaw(buf);
-            if (n === 0) throw new Error("TLS handshake failed: connection closed");
-            let toFeed = buf.subarray(0, n);
-            while (toFeed.length > 0) {
-                const c = this.feedCipher(toFeed);
-                if (c <= 0) throw new Error(`SSL feed failed during handshake: consumed=${c}`);
-                toFeed = c < toFeed.length ? toFeed.subarray(c) : new Uint8Array(0);
-            }
+        const deadline = this.startHandshakeDeadline();
+        this._handshaking = true;
+        try {
             this.sslPipe.handshake();
-            const out = this.sslPipe.getOutput();
-            if (out) await this.socket.write(new Uint8Array(out));
+            const initial = this.sslPipe.getOutput();
+            if (initial) await this.socket.write(new Uint8Array(initial));
+
+            const buf = new Uint8Array(READ_SIZE);
+            while (!this.sslPipe.handshakeComplete) {
+                const n = await this.readRaw(buf);
+                if (n === 0) throw new Error("TLS handshake failed: connection closed");
+                let toFeed = buf.subarray(0, n);
+                while (toFeed.length > 0) {
+                    const c = this.feedCipher(toFeed);
+                    if (c <= 0) throw new Error(`SSL feed failed during handshake: consumed=${c}`);
+                    toFeed = c < toFeed.length ? toFeed.subarray(c) : new Uint8Array(0);
+                }
+                this.sslPipe.handshake();
+                this.notifyInput();   // lets a write issued during the handshake retry SSL_write
+                const out = this.sslPipe.getOutput();
+                if (out) await this.socket.write(new Uint8Array(out));
+            }
+        } finally {
+            this._handshaking = false;
+            this.notifyInput();
+            deadline();
         }
+    }
+
+    /**
+     * Arm the handshake timeout. Closing the socket is what actually unblocks the
+     * loop: the pending readRaw then completes and the loop throws. Returns the
+     * disarm function — call it on every exit path so the timer never outlives
+     * the handshake.
+     */
+    private startHandshakeDeadline(): () => void {
+        if (HANDSHAKE_TIMEOUT_MS <= 0) return () => { /* disabled */ };
+        const tid = timers.setTimeout(() => { this.close(); }, HANDSHAKE_TIMEOUT_MS);
+        return () => { timers.clearTimeout(tid); };
     }
 
     /* -------------------------------------------------------------- */
@@ -248,6 +400,9 @@ export class TcpSocket implements ISocket {
         this.stopReading();
         try { this.sslPipe?.shutdown(); } catch { /* ignore */ }
         this.sslPipe = null;
+        // Wake writes parked in makeWriteProgress; the retry sees sslPipe === null and
+        // rejects at once instead of waiting out WRITE_STALL_TIMEOUT_MS on a dead socket.
+        this.notifyInput();
         try { this.socket.close(); } catch { /* ignore */ }
     }
 
@@ -263,11 +418,18 @@ export class TcpSocket implements ISocket {
         return n;
     }
 
-    private readRaw(buf: Uint8Array): Promise<number> {
-        return this.socket.read(buf).catch((err) => {
-            if (this._closed && TcpSocket.isDisconnectError(err)) return 0;
-            throw err;
-        });
+    private async readRaw(buf: Uint8Array): Promise<number> {
+        // Flagged so a stalled SSL_write knows a read is already outstanding and waits
+        // for its result instead of racing it into "read already in progress".
+        this._readInFlight = true;
+        try {
+            return await this.socket.read(buf).catch((err) => {
+                if (this._closed && TcpSocket.isDisconnectError(err)) return 0;
+                throw err;
+            });
+        } finally {
+            this._readInFlight = false;
+        }
     }
 
     private feedAndRead(data: Uint8Array, size: number): Uint8Array | null {
@@ -300,6 +462,7 @@ export class TcpSocket implements ISocket {
         const consumed = this.feedCipher(cipher);
         this.pending = consumed < cipher.length ? cipher.subarray(consumed) : null;
         this.sslPipe?.handshake();
+        this.notifyInput();
         await this.flushOutput();
     }
 

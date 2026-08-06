@@ -26,6 +26,7 @@ import {
     type StreamPoll
 } from "./protocol";
 import { assert } from "../utils/assert";
+import { dbg } from "./debug";
 
 const console = import.meta.use('console');
 const engine = import.meta.use('engine');
@@ -49,6 +50,7 @@ export interface ServerConfig {
     requestTimeout?: number;
     protocols?: HttpVersion[];
     maxHeadersCount?: number;
+    maxHeaderSize?: number;
     maxConnections?: number;
 }
 
@@ -100,6 +102,25 @@ if (h2Available()) {
     PROTOCOL_MODULES.set(HttpVersion.HTTP2, h2);
 }
 
+/**
+ * Can this build actually SERVE `v`, as opposed to merely being configured for it?
+ *
+ * Availability has to be consulted at three points, not one. Filtering only the
+ * advertised ALPN list is not enough: for `protocols: [HTTP2]` on a build without
+ * the native, the filtered list is empty, so no ALPN extension is sent, so
+ * negotiateProtocol() runs with `undefined` and its no-ALPN fallback used to
+ * return HTTP2 regardless — throwing "Unsupported HTTP protocol version: 2"
+ * after a completed handshake. Negotiation must know too.
+ *
+ * HTTP/1.0 is deliberately treated as servable: negotiateProtocol() folds an
+ * `http/1.0` ALPN into HTTP11 and serves it with the h1 module, so gating it on
+ * a PROTOCOL_MODULES entry it never had would newly break a working config.
+ */
+function isServable(v: HttpVersion): boolean {
+    if (v === HttpVersion.HTTP10) return PROTOCOL_MODULES.has(HttpVersion.HTTP11);
+    return PROTOCOL_MODULES.has(v);
+}
+
 /* ------------------------------------------------------------------ */
 /* Server                                                             */
 /* ------------------------------------------------------------------ */
@@ -112,6 +133,13 @@ export class Server {
     private listener: CModuleStreams.TCP | CModuleStreams.Pipe | null = null;
     private sslContext: CModuleSSL.Context | null = null;
     private connections = new Set<ProtocolConnection>();
+    /**
+     * One entry per in-flight handleConnection(). Drain completes when this empties,
+     * which — unlike watching `connections` — cannot wedge: close() is idempotent and
+     * will not re-fire onClose for an already-closed connection, so a connection that
+     * died before shutdown() would sit in `connections` forever and hang the drain.
+     */
+    private inflight = new Set<Promise<void>>();
     private listening = false;
     private draining = false;
     private drainResolve: (() => void) | null = null;
@@ -122,6 +150,32 @@ export class Server {
             this._drainResolved = true;
             this.drainResolve();
         }
+    }
+
+    /**
+     * The configured protocols minus any this build cannot actually serve. Used for
+     * both the advertised ALPN list and negotiation, so the two cannot disagree —
+     * advertising `h2` we then refuse is what dropped a connection that HTTP/1.1
+     * would have served.
+     *
+     * Public deliberately. A caller that asked for HTTP/2 for a performance or
+     * security reason must be able to find out it did not get it; a dbg() line
+     * nobody reads does not inform them, and throwing from listen() would break a
+     * caller that lists HTTP2 opportunistically and is happy with H1. So the
+     * downgrade is silent on the wire but explicit to the program:
+     *
+     *     server.listen();
+     *     if (!server.effectiveProtocols.includes(HttpVersion.HTTP2)) throw ...;
+     *
+     * Valid before listen() too — availability is fixed at module load.
+     */
+    get effectiveProtocols(): HttpVersion[] {
+        return this.config.protocols.filter(isServable);
+    }
+
+    /** Configured but not servable by this build. Empty on a complete build. */
+    get unavailableProtocols(): HttpVersion[] {
+        return this.config.protocols.filter(v => !isServable(v));
     }
 
     constructor(handler: RequestHandler, config: ServerConfig) {
@@ -137,14 +191,26 @@ export class Server {
             requestTimeout: config.requestTimeout ?? 300000,
             protocols: config.protocols ?? [HttpVersion.HTTP11],
             maxHeadersCount: config.maxHeadersCount ?? 2000,
+            maxHeaderSize: config.maxHeaderSize ?? 16384,
             maxConnections: config.maxConnections ?? 0,
         };
     }
 
     listen(): void {
         assert(!this.listening, "Server already listening");
+        // Advertise only what this build can serve. Advertising `h2` on a build
+        // without the native extension steers a client that would happily have
+        // spoken HTTP/1.1 into a protocol we then drop the connection over.
+        const servable = this.effectiveProtocols;
+        const dropped = this.unavailableProtocols;
+        if (dropped.length > 0) {
+            dbg('http.conn', () =>
+                `Server: dropping unavailable protocol(s) [${dropped.join(', ')}] from `
+                + `ALPN/negotiation; serving [${servable.join(', ')}]. HTTP/2 requires `
+                + `-DCNO_EMBED_EXT_H2=ON or a loadable ext:h2.`);
+        }
         if (this.config.cert && this.config.key) {
-            const alpn = defaultAlpnProtocols(this.config.protocols);
+            const alpn = defaultAlpnProtocols(servable);
             this.sslContext = new ssl.Context({
                 mode: "server",
                 cert: this.config.cert,
@@ -173,7 +239,10 @@ export class Server {
         assert(this.listener, "Server not listening");
         const listener = this.listener;
         const proto = this.sslContext ? "https" : "http";
-        console.debug(`Server listening on ${proto}://${this.config.hostname}:${this.config.port}`);
+        // Was an unconditional console.debug. A library must not write to stdout unasked:
+        // it is one line Node's http server does not emit, and it corrupts any program
+        // that consumes cno's stdout as data.
+        dbg('http.conn', () => `Server listening on ${proto}://${this.config.hostname}:${this.config.port}`);
 
         listener.onconnection = (error: CModuleError.Error | undefined, client: CModuleStreams.Stream | undefined) => {
             if (error) {
@@ -192,10 +261,15 @@ export class Server {
                 client.setKeepAlive(true, 1000);
             }
             const tcpSocket = new TcpSocket(client);
-            this.handleConnection(tcpSocket).catch((e: Error) => {
+            const done = this.handleConnection(tcpSocket).catch((e: Error) => {
                 // Handshake/negotiation rejects before registration: close or the fd leaks.
                 tcpSocket.close();
                 if (!TcpSocket.isDisconnectError(e)) console.error("Connection error:", e);
+            });
+            this.inflight.add(done);
+            void done.then(() => {
+                this.inflight.delete(done);
+                if (this.draining && this.inflight.size === 0) this._completeDrain();
             });
         };
     }
@@ -215,7 +289,9 @@ export class Server {
         const drainPromise = new Promise<void>(resolve => { this.drainResolve = resolve; });
         this.listener?.close(); this.listener = null; this.listening = false;
         for (const conn of this.connections) conn.close();
-        if (this.connections.size === 0) this._completeDrain();
+        // Drain on the handler set, not the connection set: a connection closed before
+        // shutdown() will not fire onClose again, and its stale entry would block forever.
+        if (this.inflight.size === 0) this._completeDrain();
         return drainPromise;
     }
 
@@ -241,19 +317,30 @@ export class Server {
         // Negotiate protocol
         const version = this.negotiateProtocol(alpnProtocol);
         if (!version) {
-            console.error(`No supported protocol negotiated (ALPN: ${alpnProtocol})`);
+            // Name the cause. "No supported protocol negotiated" alone cannot be
+            // told apart from a misconfiguration by anyone reading a log, and this
+            // path is now also reached when a protocol is configured but the build
+            // cannot serve it.
+            const unavailable = this.unavailableProtocols;
+            const because = unavailable.length > 0
+                ? ` — configured protocol(s) [${unavailable.join(', ')}] are not available in `
+                  + `this build (HTTP/2 requires -DCNO_EMBED_EXT_H2=ON or a loadable ext:h2)`
+                : '';
+            console.error(
+                `No supported protocol negotiated (ALPN: ${alpnProtocol})${because}`);
             socket.close();
             return;
         }
 
         const protoConfig: ProtocolServerConfig = {
             secure,
-            alpnProtocols: defaultAlpnProtocols(this.config.protocols),
+            alpnProtocols: defaultAlpnProtocols(this.effectiveProtocols),
             cert: this.config.cert, key: this.config.key,
             maxConcurrentStreams: 100,
             keepAliveTimeout: this.config.keepAliveTimeout,
             requestTimeout: this.config.requestTimeout,
             maxHeadersCount: this.config.maxHeadersCount,
+            maxHeaderSize: this.config.maxHeaderSize,
             maxConnections: this.config.maxConnections,
         };
 
@@ -262,39 +349,48 @@ export class Server {
         const protoConn = await protoModule.server.accept(socket, protoConfig);
         this.connections.add(protoConn);
 
-        if (version === HttpVersion.HTTP2) {
-            await this.h2RequestLoop(protoConn as H2Connection, socket);
-            this.connections.delete(protoConn);
-            if (this.draining && this.connections.size === 0) this._completeDrain();
-            try {
-                protoConn.close();
-            } catch {
-                /* already closed */
+        // Every exit from here must drop the connection from the set. A throw that
+        // skipped it would leave a dead entry behind forever: shutdown() waits for the
+        // set to empty, so one leak hangs drain and slowly leaks memory besides.
+        try {
+            if (version === HttpVersion.HTTP2) {
+                await this.h2RequestLoop(protoConn as H2Connection, socket);
+                try {
+                    protoConn.close();
+                } catch {
+                    /* already closed */
+                }
+                return;
             }
-            return;
-        }
 
-        // Set up event handlers
-        protoConn.on({
-            onError: (err: Error) => console.error(`Protocol error:`, err),
-            onClose: () => {
-                this.connections.delete(protoConn);
-                if (this.draining && this.connections.size === 0) this._completeDrain();
-            },
-        });
+            // Set up event handlers
+            protoConn.on({
+                onError: (err: Error) => console.error(`Protocol error:`, err),
+                onClose: () => { this.connections.delete(protoConn); },
+            });
 
-        await this.h1RequestLoop(protoConn as H1ServerConnection);
-        // Non-upgraded connections: close so onClose fires and cleans up the set.
-        // Upgraded connections (WebSocket etc.) stay in the set; their close() is
-        // called either by the protocol layer or by shutdown().
-        if (!(protoConn as H1ServerConnection).isUpgraded) {
-            protoConn.close();
+            await this.h1RequestLoop(protoConn as H1ServerConnection);
+            // Non-upgraded connections: close so onClose fires and cleans up the set.
+            // Upgraded connections (WebSocket etc.) stay in the set; their close() is
+            // called either by the protocol layer or by shutdown().
+            if (!(protoConn as H1ServerConnection).isUpgraded) {
+                protoConn.close();
+            }
+        } finally {
+            // Upgraded H1 connections keep serving on the raw socket — leave those
+            // registered so shutdown() can still close them.
+            const upgraded = version !== HttpVersion.HTTP2
+                && (protoConn as H1ServerConnection).isUpgraded;
+            if (!upgraded) this.connections.delete(protoConn);
         }
     }
 
     private negotiateProtocol(alpnProtocol?: string): HttpVersion | null {
         const allowed = this.config.protocols;
-        const allow = (v: HttpVersion) => allowed.includes(v);
+        // Configured AND servable. Consulting only the config is what let a build
+        // without the h2 native negotiate HTTP/2 and then throw at the
+        // PROTOCOL_MODULES lookup, after the handshake had already completed.
+        const allow = (v: HttpVersion) => allowed.includes(v) && isServable(v);
 
         if (alpnProtocol === ALPN.HTTP2 || alpnProtocol === ALPN.HTTP2C) {
             return allow(HttpVersion.HTTP2) ? HttpVersion.HTTP2 : null;
@@ -466,6 +562,9 @@ export class Server {
             let tid: number | null = timeoutMs > 0
                 ? timers.setTimeout(() => { timedOut = true; conn.close(); }, timeoutMs)
                 : null;
+            // Last allowed request: tell H1 before the handler writes, so the response
+            // announces Connection: close instead of promising a reuse we then refuse.
+            if (requestCount + 1 >= this.config.maxRequestsPerConnection) conn.disableKeepAlive();
             try {
                 keepAlive = await conn.handleRequest(async (req: RawRequest, _res: RawResponse) => {
                     const httpReq = this.toHttpRequest(req);

@@ -17,10 +17,25 @@ const CHUNKED_TRAILER = engine.encodeString('0\r\n\r\n');
  * `headerBlock` is zero or more `Name: value\r\n` lines (no trailing blank).
  */
 export function formatHead(startLine: string, headerBlock = ''): string {
+    // The start line carries user-supplied pieces (reason phrase, method, request
+    // target). A CR/LF/NUL in any of them would terminate the line early and let
+    // the rest be read as extra headers or a second response — classic response
+    // splitting. Node throws ERR_INVALID_CHAR here; reject rather than emit.
+    assertNoControlChars(startLine);
     const block = !headerBlock
         ? ''
         : (headerBlock.endsWith('\r\n') ? headerBlock : `${headerBlock}\r\n`);
     return `${startLine}\r\n${block}\r\n`;
+}
+
+/** Throws when `value` contains CR, LF or NUL (would break out of its wire line). */
+export function assertNoControlChars(value: string): void {
+    if (/[\r\n\0]/.test(value)) {
+        throw Object.assign(
+            new Error(`Invalid character in HTTP start line: ${JSON.stringify(value)}`),
+            { code: 'ERR_INVALID_CHAR' },
+        );
+    }
 }
 
 export function encodeHead(startLine: string, headerBlock = ''): Uint8Array {
@@ -30,7 +45,12 @@ export function encodeHead(startLine: string, headerBlock = ''): Uint8Array {
 function formatPairs(headers: Array<[string, string]>): string {
     let block = '';
     for (const [k, v] of headers) {
-        if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) throw new Error(`invalid header: ${JSON.stringify(k)}`);
+        if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
+            throw Object.assign(
+                new Error(`invalid header: ${JSON.stringify(k)}`),
+                { code: 'ERR_INVALID_CHAR' },
+            );
+        }
         if (k) block += `${k}: ${v}\r\n`;
     }
     return block;
