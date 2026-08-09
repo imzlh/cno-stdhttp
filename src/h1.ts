@@ -535,8 +535,13 @@ export class H1ServerConnection implements ProtocolConnection {
             const ver = `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`;
             this.requestHttpVersion = ver;
             this.keepAlive = wantsKeepAlive(ver, connH) && !this.forceClose;
-            const ae = this.reqHeaders.find(([n]) => n === 'accept-encoding')?.[1];
-            if (ae) this.compressEncoding = pickEncoding(parseAcceptEncoding(ae));
+            // Deliberately NOT negotiating response compression from accept-encoding.
+            // Neither node:http nor Deno.serve ever compresses a response the handler
+            // did not compress itself, and doing so silently invalidates the handler's
+            // Content-Length (express.static sets it from stat()) — the peer then gets
+            // a chunked gzip stream with no length, and any CL-dependent client,
+            // proxy or progress bar is wrong. Compression is the app's job
+            // (compression middleware), which sets content-encoding itself.
             const cl = this.reqHeaders.find(([n]) => n === 'content-length')?.[1];
             const te = this.reqHeaders.find(([n]) => n === 'transfer-encoding')?.[1];
             // RFC 7230 §3.3.3: TE wins when both CL and TE are present (closes CL.TE smuggling).
@@ -762,9 +767,14 @@ export class H1ServerConnection implements ProtocolConnection {
         // handler set them (HEAD must mirror GET), but no body byte may ever be written.
         this.bodyless = isBodyForbiddenStatus || this.method === 'HEAD';
         if (isBodyForbiddenStatus) {
+            // Strip only the FRAMING headers. content-length is metadata about the
+            // representation, not a promise of bytes on this response: RFC 9110 says a
+            // 304/204 never carries a body whatever the length says, and node:http
+            // passes a handler-set Content-Length straight through on a 304 (measured).
+            // Dropping it loses a cache validator's size and diverges from node.
             headers = headers.filter(([n]) => {
                 const key = n.toLowerCase();
-                return key !== 'content-length' && key !== 'content-encoding' && key !== 'transfer-encoding';
+                return key !== 'content-encoding' && key !== 'transfer-encoding';
             });
             this.chunkedEncoding = false;
             this.compressor = null;
@@ -776,18 +786,10 @@ export class H1ServerConnection implements ProtocolConnection {
         // wire says close while the server keeps looping for another request on a socket
         // the peer has stopped using — the connection lingers until the idle timer fires.
         if (connectionTokens(headerValue('connection')).includes('close')) this.keepAlive = false;
-        // Never negotiate compression for a bodyless response: the gzip trailer and the
-        // terminating chunk would be read by the peer as the start of the next response.
-        if (!this.bodyless && this.compressEncoding && !hasHeader('content-encoding') && !this.chunkedEncoding) {
-            const ct = headerValue('content-type');
-            if (!ct || shouldCompress(ct)) {
-                this.compressor = new StreamingCompressor(this.compressEncoding);
-                headers.push(['content-encoding', this.compressEncoding]);
-                headers.push(['transfer-encoding', 'chunked']);
-                headers = headers.filter(([n]) => n.toLowerCase() !== 'content-length');
-                this.chunkedEncoding = true;
-            }
-        }
+        // No opportunistic compression here: see onHeadersComplete. `compressor` is
+        // only ever non-null if a caller wires one up explicitly, so the guards in
+        // writeData/endResponse below stay correct without re-introducing the
+        // Content-Length-dropping auto-gzip path.
         // No framing given by the handler: chunked on 1.1, close-delimited otherwise (Node parity).
         const needsFraming = !isBodyForbiddenStatus && this.method !== 'HEAD'
             && !this.chunkedEncoding && !hasHeader('content-length');
@@ -833,6 +835,12 @@ export class H1ServerConnection implements ProtocolConnection {
         if (this.bodyless) return;
         let data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
         if (this.compressor) data = this.compressor.compress(data);
+        // A zero-length chunked frame IS the terminator (`0\r\n\r\n`): emitting one
+        // mid-body tells the peer the response ended, silently truncating everything
+        // after it. Node treats an empty write as a no-op on the wire, so drop it.
+        // (Reached by res.write('')/write(empty buffer), and by any streaming
+        // compressor that buffers a chunk and returns nothing.)
+        if (data.byteLength === 0) return;
         try {
             if (this.chunkedEncoding) await this.socket.write(encodeChunkedFrame(data));
             else await this.socket.write(data);
