@@ -17,7 +17,7 @@ function isTcpStream(stream: CModuleStreams.Stream): stream is CModuleStreams.TC
 
 import { TcpSocket, type ISocket } from "./socket";
 import { h1, H1ServerConnection } from "./h1";
-import { h2, type H2Connection, type H2Stream } from "./h2";
+import { h2, H2Connection, type H2Stream } from "./h2";
 import { h2Available } from "./h2-native";
 import {
     type RawRequest, type RawResponse,
@@ -72,6 +72,8 @@ export interface HttpResponse {
     write(chunk: Uint8Array | string): Promise<void>;
     end(chunk?: Uint8Array | string): Promise<void>;
     upgrade(): UpgradedConnection;
+    /** Subscribe to terminal H1 transport close; returns an unsubscribe function. */
+    onTerminalClose?(listener: () => void): () => void;
     close(): void;
 }
 
@@ -133,20 +135,33 @@ export class Server {
     private listener: CModuleStreams.TCP | CModuleStreams.Pipe | null = null;
     private sslContext: CModuleSSL.Context | null = null;
     private connections = new Set<ProtocolConnection>();
-    /**
-     * One entry per in-flight handleConnection(). Drain completes when this empties,
-     * which — unlike watching `connections` — cannot wedge: close() is idempotent and
-     * will not re-fire onClose for an already-closed connection, so a connection that
-     * died before shutdown() would sit in `connections` forever and hang the drain.
-     */
+    /** One entry per in-flight handleConnection(), including protocol handshakes. */
     private inflight = new Set<Promise<void>>();
     private listening = false;
     private draining = false;
     private drainResolve: (() => void) | null = null;
     private _drainResolved = false;
+    private drainPromise: Promise<void> | null = null;
+
+    private hasGracefulConnections(): boolean {
+        // Upgraded sockets remain force-closeable but do not block graceful close.
+        return [...this.connections].some(conn =>
+            !(conn instanceof H1ServerConnection && conn.isUpgraded));
+    }
+
+    private applyDrainPolicy(conn: ProtocolConnection, force: boolean): void {
+        if (force) {
+            conn.close();
+        } else if (conn instanceof H1ServerConnection || conn instanceof H2Connection) {
+            conn.beginDrain();
+        } else {
+            conn.goaway();
+        }
+    }
 
     private _completeDrain(): void {
-        if (!this._drainResolved && this.drainResolve) {
+        if (!this._drainResolved && this.drainResolve
+            && this.inflight.size === 0 && !this.hasGracefulConnections()) {
             this._drainResolved = true;
             this.drainResolve();
         }
@@ -198,9 +213,7 @@ export class Server {
 
     listen(): void {
         assert(!this.listening, "Server already listening");
-        // Advertise only what this build can serve. Advertising `h2` on a build
-        // without the native extension steers a client that would happily have
-        // spoken HTTP/1.1 into a protocol we then drop the connection over.
+        // Advertise only protocols this build can serve.
         const servable = this.effectiveProtocols;
         const dropped = this.unavailableProtocols;
         if (dropped.length > 0) {
@@ -239,9 +252,7 @@ export class Server {
         assert(this.listener, "Server not listening");
         const listener = this.listener;
         const proto = this.sslContext ? "https" : "http";
-        // Was an unconditional console.debug. A library must not write to stdout unasked:
-        // it is one line Node's http server does not emit, and it corrupts any program
-        // that consumes cno's stdout as data.
+        // Libraries must not write connection diagnostics to application stdout.
         dbg('http.conn', () => `Server listening on ${proto}://${this.config.hostname}:${this.config.port}`);
 
         listener.onconnection = (error: CModuleError.Error | undefined, client: CModuleStreams.Stream | undefined) => {
@@ -283,16 +294,30 @@ export class Server {
         this.listener = null;
     }
 
-    async shutdown(): Promise<void> {
-        if (this.draining) return;
+    private beginDrain(force: boolean): Promise<void> {
+        if (this.draining) {
+            if (force) {
+                for (const conn of this.connections) conn.close();
+                if (this.inflight.size === 0) this._completeDrain();
+            }
+            return this.drainPromise ?? Promise.resolve();
+        }
         this.draining = true;
-        const drainPromise = new Promise<void>(resolve => { this.drainResolve = resolve; });
+        this.drainPromise = new Promise<void>(resolve => { this.drainResolve = resolve; });
         this.listener?.close(); this.listener = null; this.listening = false;
-        for (const conn of this.connections) conn.close();
-        // Drain on the handler set, not the connection set: a connection closed before
-        // shutdown() will not fire onClose again, and its stale entry would block forever.
-        if (this.inflight.size === 0) this._completeDrain();
-        return drainPromise;
+        for (const conn of this.connections) this.applyDrainPolicy(conn, force);
+        this._completeDrain();
+        return this.drainPromise;
+    }
+
+    /** Stop accepting new connections and let active requests finish. */
+    closeGracefully(): Promise<void> {
+        return this.beginDrain(false);
+    }
+
+    /** Force-close all connections immediately. */
+    shutdown(): Promise<void> {
+        return this.beginDrain(true);
     }
 
     address(): { ip: string; port: number } | { path: string } | null {
@@ -317,10 +342,7 @@ export class Server {
         // Negotiate protocol
         const version = this.negotiateProtocol(alpnProtocol);
         if (!version) {
-            // Name the cause. "No supported protocol negotiated" alone cannot be
-            // told apart from a misconfiguration by anyone reading a log, and this
-            // path is now also reached when a protocol is configured but the build
-            // cannot serve it.
+            // Distinguish unsupported builds from negotiation failures.
             const unavailable = this.unavailableProtocols;
             const because = unavailable.length > 0
                 ? ` — configured protocol(s) [${unavailable.join(', ')}] are not available in `
@@ -349,12 +371,14 @@ export class Server {
         const protoConn = await protoModule.server.accept(socket, protoConfig);
         this.connections.add(protoConn);
 
-        // Every exit from here must drop the connection from the set. A throw that
-        // skipped it would leave a dead entry behind forever: shutdown() waits for the
-        // set to empty, so one leak hangs drain and slowly leaks memory besides.
+        // Every exit must release connection tracking so shutdown can drain.
         try {
             if (version === HttpVersion.HTTP2) {
-                await this.h2RequestLoop(protoConn as H2Connection, socket);
+                const loop = this.h2RequestLoop(protoConn as H2Connection, socket);
+                // h2RequestLoop installs its close/error listeners synchronously;
+                // apply a racing drain only after those listeners exist.
+                if (this.draining) this.applyDrainPolicy(protoConn, false);
+                await loop;
                 try {
                     protoConn.close();
                 } catch {
@@ -366,30 +390,31 @@ export class Server {
             // Set up event handlers
             protoConn.on({
                 onError: (err: Error) => console.error(`Protocol error:`, err),
-                onClose: () => { this.connections.delete(protoConn); },
+                onClose: () => {
+                    this.connections.delete(protoConn);
+                    if (this.draining) this._completeDrain();
+                },
             });
+            // Install close tracking before applying a racing drain.
+            if (this.draining) this.applyDrainPolicy(protoConn, false);
 
             await this.h1RequestLoop(protoConn as H1ServerConnection);
-            // Non-upgraded connections: close so onClose fires and cleans up the set.
-            // Upgraded connections (WebSocket etc.) stay in the set; their close() is
-            // called either by the protocol layer or by shutdown().
+            // Upgraded connections remain tracked until protocol or server shutdown.
             if (!(protoConn as H1ServerConnection).isUpgraded) {
                 protoConn.close();
             }
         } finally {
-            // Upgraded H1 connections keep serving on the raw socket — leave those
-            // registered so shutdown() can still close them.
+            // Retain upgraded raw sockets for force shutdown.
             const upgraded = version !== HttpVersion.HTTP2
                 && (protoConn as H1ServerConnection).isUpgraded;
             if (!upgraded) this.connections.delete(protoConn);
+            if (this.draining) this._completeDrain();
         }
     }
 
     private negotiateProtocol(alpnProtocol?: string): HttpVersion | null {
         const allowed = this.config.protocols;
-        // Configured AND servable. Consulting only the config is what let a build
-        // without the h2 native negotiate HTTP/2 and then throw at the
-        // PROTOCOL_MODULES lookup, after the handshake had already completed.
+        // Negotiation requires both configuration and an available implementation.
         const allow = (v: HttpVersion) => allowed.includes(v) && isServable(v);
 
         if (alpnProtocol === ALPN.HTTP2 || alpnProtocol === ALPN.HTTP2C) {
@@ -416,21 +441,28 @@ export class Server {
 
     private async h2RequestLoop(conn: H2Connection, socket: TcpSocket): Promise<void> {
         await new Promise<void>(resolve => {
-            let done = false;
+            let connectionDone = false;
+            let resolved = false;
+            const handlers = new Set<Promise<void>>();
             const finish = () => {
-                if (done) return;
-                done = true;
+                if (!connectionDone || resolved || handlers.size !== 0) return;
+                resolved = true;
                 resolve();
             };
+            const markConnectionDone = () => {
+                connectionDone = true;
+                finish();
+            };
             conn.on({
-                onClose: finish,
+                onClose: markConnectionDone,
                 onError: (err: Error) => {
                     if (!TcpSocket.isDisconnectError(err)) console.error('HTTP/2 protocol error:', err);
-                    finish();
+                    conn.destroy();
+                    markConnectionDone();
                 },
             });
             conn.onStreamOpen = stream => {
-                void this.handleH2Stream(stream).catch((e: Error) => {
+                const handler = this.handleH2Stream(stream).catch((e: Error) => {
                     if (!TcpSocket.isDisconnectError(e)) {
                         try {
                             if (this.onRequestError) this.onRequestError(e, socket);
@@ -444,14 +476,21 @@ export class Server {
                     } catch {
                         /* */
                     }
+                }).finally(() => {
+                    handlers.delete(handler);
+                    finish();
                 });
+                handlers.add(handler);
             };
         });
     }
 
     private async handleH2Stream(stream: H2Stream): Promise<void> {
-        await new Promise<void>(resolve => {
+        await new Promise<void>((resolve, reject) => {
             stream.whenHeaders(() => resolve());
+            // Reject streams closed before request headers to release handlers.
+            stream.whenError(reject);
+            stream.whenClosed(() => reject(new Error('HTTP/2 stream closed before request headers')));
         });
         const headers = stream.headerList ?? [];
         let method = 'GET';
@@ -493,13 +532,18 @@ export class Server {
 
     private toH2HttpResponse(stream: H2Stream): HttpResponse {
         let headersSent = false;
+        let bodyless = false;
         const response: HttpResponse = {
             status: 200,
             statusText: 'OK',
             headers: [],
             writeHead: async (status: number, _statusText?: string, headers?: Array<[string, string]>) => {
-                if (headersSent) return;
-                headersSent = true;
+                const informational = status >= 100 && status < 200;
+                if (headersSent && !informational) return;
+                if (!informational) headersSent = true;
+                // Informational H2 headers do not terminate the stream; only
+                // final statuses with a forbidden body use END_STREAM here.
+                bodyless = status === 204 || status === 205 || status === 304;
                 const h2h: Array<[string, string]> = [[':status', String(status)]];
                 for (const [n, v] of headers ?? []) {
                     const lower = n.toLowerCase();
@@ -510,28 +554,25 @@ export class Server {
                     }
                     h2h.push([n, v]);
                 }
-                stream.respond(h2h, false);
+                // Informational headers do not terminate the stream; a final
+                // status may follow before response body data is sent.
+                stream.respond(h2h, !informational && bodyless);
             },
             write: async (chunk: Uint8Array | string) => {
                 if (!headersSent) {
                     await response.writeHead(200, 'OK', [['content-type', 'application/octet-stream']]);
                 }
+                if (bodyless) return;
                 const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
                 stream.sendData(data, false);
             },
             end: async (chunk?: Uint8Array | string) => {
                 if (!headersSent) {
-                    headersSent = true;
-                    if (chunk !== undefined) {
-                        const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
-                        stream.respond([[':status', '200']], false);
-                        stream.sendData(data, true);
-                    } else {
-                        stream.respond([[':status', '200']], true);
-                    }
-                    return;
+                    await response.writeHead(200, 'OK', []);
                 }
-                if (chunk !== undefined) {
+                if (bodyless) {
+                    return;
+                } else if (chunk !== undefined) {
                     const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
                     stream.sendData(data, true);
                 } else {
@@ -571,9 +612,7 @@ export class Server {
                     const httpRes = this.toHttpResponse(conn);
                     await this.handler(httpReq, httpRes);
                 }, () => {
-                    // Headers arrived: the connection is no longer idle. Cancel the
-                    // keep-alive/request timer so it bounds only the idle wait for
-                    // the next request — not body streaming or handler execution.
+                    // The request timer bounds only idle header waits.
                     if (tid !== null) { timers.clearTimeout(tid); tid = null; }
                 });
                 firstRequest = false;
@@ -611,7 +650,7 @@ export class Server {
             status: 200, statusText: 'OK', headers: [] as Array<[string, string]>,
             writeHead: async (status: number, statusText?: string, headers?: Array<[string, string]>) => {
                 await conn.writeHead(status, statusText ?? 'OK', headers ?? []);
-                headersSent = true;
+                if (!(status >= 100 && status < 200 && status !== 101)) headersSent = true;
             },
             write: async (chunk: Uint8Array | string) => {
                 if (!headersSent) { await conn.writeHead(200, 'OK', [['transfer-encoding', 'chunked']]); headersSent = true; }
@@ -644,6 +683,7 @@ export class Server {
                     isClosed: () => conn.isClosed(),
                 };
             },
+            onTerminalClose: (listener: () => void) => conn.onTerminalClose(listener),
             close: () => conn.close(),
         };
         Reflect.set(response as object, '__cnoTcp', conn.socket.socket);

@@ -141,6 +141,11 @@ export class StreamingDecompressor {
         const stream = this._stream;
         if (!stream || this._finished) return new Uint8Array(0);
         this._finished = true;
+        // circu.js marks an inflater finished as soon as inflate() sees the trailer,
+        // so a following finish() is a duplicate and throws. Test the state instead
+        // of matching the thrown message: the message is not part of any contract and
+        // a reworded throw would silently turn this back into a hard error.
+        if (stream.finished) return new Uint8Array(0);
         const out = new Uint8Array(stream.finish());
         this._total += out.length;
         if (this._total > this._maxOutput) throw new Error(`decompressed output exceeds ${this._maxOutput} bytes`);

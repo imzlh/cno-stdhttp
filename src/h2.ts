@@ -62,6 +62,11 @@ function pick(headers: H2Header[], name: string): string | undefined {
     return undefined;
 }
 
+function isInformational(headers: H2Header[]): boolean {
+    const status = Number(pick(headers, ':status') ?? 0);
+    return status >= 100 && status < 200 && status !== 101;
+}
+
 function toRawHeaders(headers: H2Header[]): RawHeaders {
     return headers.map(([n, v]) => [n, v]);
 }
@@ -115,11 +120,14 @@ export class H2Stream implements ProtocolStream {
     private locallyEnded = false;
     private closed = false;
     private headSent = false;
+    private finalHeadSent = false;
+    private outputEnded = false;
     private messageWaiters: Array<{
         resolve: (v: RawRequest | RawResponse) => void;
         reject: (e: Error) => void;
     }> = [];
     private headerWaiters: Array<(headers: H2Header[], ended: boolean) => void> = [];
+    private closeWaiters: Array<() => void> = [];
     private dataWaiters: Array<() => void> = [];
     private bodyOnce: Uint8Array | null | undefined;
     private trailers: H2Header[][] = [];
@@ -133,6 +141,9 @@ export class H2Stream implements ProtocolStream {
     }
 
     acceptHeaders(headers: H2Header[], flags: number): void {
+        // 1xx response headers are not the response message. Keep them out of
+        // the final-header slot so a later 200/204 is still delivered normally.
+        if (!this.isServer && isInformational(headers)) return;
         this.headers = headers;
         if (flags & END_STREAM) { this.ended = true; this.endStreamSeen = true; }
         const cbs = this.headerWaiters.splice(0);
@@ -145,7 +156,7 @@ export class H2Stream implements ProtocolStream {
         // only re-grows a buffer we just discarded. Without this a peer that ignores our
         // RST_STREAM refills up to MAX_BUFFERED_BODY_BYTES and trips the cap again, and
         // again — one RST per 16 MiB for as long as it keeps sending.
-        if (this.streamError || this.closed) return;
+        if (this.streamError || this.closed || this.ended) return;
         if (chunk.byteLength > 0) {
             this.chunks.push(chunk);
             this.buffered += chunk.byteLength;
@@ -187,6 +198,14 @@ export class H2Stream implements ProtocolStream {
     }
 
     acceptTrailers(headers: H2Header[], flags: number): void {
+        // nghttp2 reports a final response after informational HEADERS through
+        // the generic HEADERS callback. With no final headers yet, this is the
+        // response head, not a trailer block.
+        if (!this.isServer && this.headers === null) {
+            this.acceptHeaders(headers, flags);
+            return;
+        }
+        if (!this.isServer && isInformational(headers)) return;
         this.trailers.push(headers);
         if (flags & END_STREAM) { this.ended = true; this.endStreamSeen = true; }
         this.wakeData();
@@ -209,7 +228,7 @@ export class H2Stream implements ProtocolStream {
                 new Error(`HTTP/2 stream closed with error code ${errorCode}`),
                 { code: 'ERR_HTTP2_STREAM_ERROR', errno: errorCode },
             ));
-        } else if (!this.endStreamSeen && !this.locallyEnded && this.headers !== null) {
+        } else if (!this.endStreamSeen && !this.locallyEnded && (this.headers !== null || !this.isServer)) {
             // The peer's half closed without ever setting END_STREAM. Before this,
             // `ended` was set here identically to a clean finish, so RST_STREAM(0)
             // after partial DATA delivered a short body with no error at all — the
@@ -224,6 +243,8 @@ export class H2Stream implements ProtocolStream {
         }
         this.closed = true;
         this.ended = true;
+        const waiters = this.closeWaiters.splice(0);
+        for (const waiter of waiters) waiter();
         this.wakeData();
         this.tryResolveMessage();
     }
@@ -232,6 +253,8 @@ export class H2Stream implements ProtocolStream {
         this.setStreamError(error);
         this.closed = true;
         this.ended = true;
+        const waiters = this.closeWaiters.splice(0);
+        for (const waiter of waiters) waiter();
         this.wakeData();
         this.tryResolveMessage();
     }
@@ -239,6 +262,9 @@ export class H2Stream implements ProtocolStream {
     private setStreamError(error: Error): void {
         if (this.streamError) return;
         this.streamError = error;
+        // Header callbacks cannot be fulfilled after a stream/connection error.
+        // Drop them so a long-lived connection does not retain request handlers.
+        this.headerWaiters = [];
         const listeners = this.errorListeners.splice(0);
         for (const listener of listeners) listener(error);
     }
@@ -301,7 +327,16 @@ export class H2Stream implements ProtocolStream {
             cb(this.headers, this.ended);
             return;
         }
+        if (this.streamError || this.closed) return;
         this.headerWaiters.push(cb);
+    }
+
+    whenClosed(cb: () => void): void {
+        if (this.closed) {
+            cb();
+            return;
+        }
+        this.closeWaiters.push(cb);
     }
 
     whenError(cb: (error: Error) => void): void {
@@ -372,10 +407,13 @@ export class H2Stream implements ProtocolStream {
     }
 
     async writeHead(data: RawRequest | RawResponse): Promise<void> {
-        if (this.headSent) throw new Error('HTTP/2 headers already sent');
-        this.headSent = true;
+        if (this.closed || this.outputEnded) throw new Error('HTTP/2 headers already sent');
         const sess = this.conn.session;
         if (isRawRequest(data)) {
+            // Replacing the old `headSent` guard with `outputEnded` left this branch with
+            // no duplicate check at all: a request *with* a body does not set outputEnded,
+            // so a second writeHead() put a second HEADERS frame on the same stream.
+            if (this.finalHeadSent) throw new Error('HTTP/2 headers already sent');
             const headers: H2Header[] = [
                 [':method', data.method],
                 [':path', data.url],
@@ -383,58 +421,95 @@ export class H2Stream implements ProtocolStream {
                 ...data.headers.filter(([n]) => !n.startsWith(':')),
             ];
             // client stream already created via request(); this path is for createStream+writeHead
-            sess.respond(this.id, headers, !data.body);
+            const end = !data.body;
+            this.headSent = true;
+            sess.respond(this.id, headers, end);
+            this.finalHeadSent = true;
+            if (end) this.outputEnded = true;
         } else {
             const headers: H2Header[] = [
                 [':status', String(data.status)],
                 ...data.headers,
             ];
+            const informational = data.status >= 100 && data.status < 200;
+            // Guard before mutating headSent, so a rejected duplicate leaves state alone.
+            if (!informational && this.finalHeadSent) throw new Error('HTTP/2 headers already sent');
             const end = data.body === null || data.body.byteLength === 0;
-            sess.respond(this.id, headers, end);
+            this.headSent = true;
+            sess.respond(this.id, headers, informational ? false : end);
+            if (informational) return;
+            this.finalHeadSent = true;
             if (data.body && data.body.byteLength > 0) {
                 sess.write(this.id, data.body, true);
             }
+            if (end || data.body && data.body.byteLength > 0) this.outputEnded = true;
         }
     }
 
     async writeData(data: Uint8Array): Promise<void> {
+        if (this.closed || this.outputEnded) throw new Error('HTTP/2 stream already ended');
+        if (!this.finalHeadSent) throw new Error('HTTP/2 final headers must be sent before DATA');
         this.conn.session.write(this.id, data, false);
     }
 
     async end(data?: Uint8Array): Promise<void> {
+        if (this.closed || this.outputEnded) throw new Error('HTTP/2 stream already ended');
         if (data && data.byteLength > 0) {
+            if (!this.finalHeadSent && this.isServer) {
+                this.conn.session.respond(this.id, [[':status', '200']], false);
+                this.headSent = true;
+                this.finalHeadSent = true;
+            }
             this.conn.session.write(this.id, data, true);
-        } else if (!this.headSent && this.isServer) {
+            this.outputEnded = true;
+        } else if (!this.finalHeadSent && this.isServer) {
             // empty response
             this.conn.session.respond(this.id, [[':status', '200']], true);
             this.headSent = true;
+            this.finalHeadSent = true;
+            this.outputEnded = true;
         } else {
             this.conn.session.write(this.id, new Uint8Array(0), true);
+            this.outputEnded = true;
         }
     }
 
     /** Server: respond with headers (+ optional body end). */
     respond(headers: H2Header[], endStream = false): void {
+        if (this.closed || this.outputEnded) throw new Error('HTTP/2 headers already sent');
+        const status = Number(headers.find(([name]) => name === ':status')?.[1] ?? 0);
+        const informational = status >= 100 && status < 200;
+        if (!informational && this.finalHeadSent) throw new Error('HTTP/2 headers already sent');
         this.headSent = true;
-        this.conn.session.respond(this.id, headers, endStream);
+        this.conn.session.respond(this.id, headers, informational ? false : endStream);
+        if (!informational) {
+            this.finalHeadSent = true;
+            if (endStream) this.outputEnded = true;
+        }
     }
 
     /** Client: headers already submitted via session.request. */
     markHeadSent(): void {
         this.headSent = true;
+        this.finalHeadSent = true;
     }
 
     sendData(data: Uint8Array, endStream = false): void {
+        if (this.closed || this.outputEnded) throw new Error('HTTP/2 stream already ended');
+        if (!this.finalHeadSent) throw new Error('HTTP/2 final headers must be sent before DATA');
         this.conn.session.write(this.id, data, endStream);
+        if (endStream) this.outputEnded = true;
     }
 
     abort(code = 0): void {
         this.locallyEnded = true;
+        this.outputEnded = true;
         this.conn.session.reset(this.id, code);
     }
 
     close(): void {
         this.locallyEnded = true;
+        this.outputEnded = true;
         if (!this.closed) this.conn.session.reset(this.id, 0);
     }
 }
@@ -457,6 +532,7 @@ export class H2Connection implements ProtocolConnection {
         onSettings: null,
     };
     private _closed = false;
+    private draining = false;
     /** Cleared the first time consume() reports the native session refills windows itself. */
     private manualWindow = true;
     /** Node-level stream open hook (server). */
@@ -495,7 +571,7 @@ export class H2Connection implements ProtocolConnection {
                 }
             }
             stream.acceptHeaders(headers, flags);
-            if (!this.isServer) {
+            if (!this.isServer && !isInformational(headers)) {
                 this.onClientHeaders?.(stream, headers, !!(flags & END_STREAM));
             }
         };
@@ -515,7 +591,12 @@ export class H2Connection implements ProtocolConnection {
         };
         sess.onheaders = (streamId: number, headers: H2Header[], flags: number) => {
             const stream = this.streams.get(streamId);
-            if (stream) stream.acceptTrailers(headers, flags);
+            if (!stream) return;
+            const hadHeaders = stream.headerList !== null;
+            stream.acceptTrailers(headers, flags);
+            if (!this.isServer && !hadHeaders && stream.headerList !== null && !isInformational(headers)) {
+                this.onClientHeaders?.(stream, headers, !!(flags & END_STREAM));
+            }
         };
         // nghttp2 does not invoke ondata for an empty DATA frame. Observe the
         // frame itself so an empty request/response still reaches EOF.
@@ -527,6 +608,7 @@ export class H2Connection implements ProtocolConnection {
             const stream = this.streams.get(streamId);
             if (stream) stream.acceptClose(errorCode);
             this.streams.delete(streamId);
+            if (this.draining && this.streams.size === 0) this.close();
         };
         sess.ongoaway = () => {
             this.events.onGoaway?.();
@@ -599,6 +681,14 @@ export class H2Connection implements ProtocolConnection {
         } catch {
             /* destroyed */
         }
+    }
+
+    /** Stop new streams and close once existing streams have ended. */
+    beginDrain(): void {
+        if (this._closed) return;
+        this.draining = true;
+        this.goaway();
+        if (this.streams.size === 0) this.close();
     }
 
     /**

@@ -12,6 +12,7 @@ const os = import.meta.use("os");
 function isIPv4(hostname: string): boolean {
     if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return false;
     return hostname.split('.').every((part) => {
+        if (part.length > 1 && part.startsWith('0')) return false;
         const value = Number(part);
         return Number.isInteger(value) && value >= 0 && value <= 255;
     });
@@ -19,9 +20,35 @@ function isIPv4(hostname: string): boolean {
 
 function isIPv6(hostname: string): boolean {
     if (!hostname.includes(':')) return false;
-    const parts = hostname.split(':');
-    if (parts.length < 3 || parts.length > 8) return false;
-    return parts.every((part) => part === '' || /^[0-9a-fA-F]{1,4}$/.test(part));
+
+    // Keep the literal check independent of DOM/Node URL implementations.
+    const compression = hostname.indexOf('::');
+    if (compression !== -1 && hostname.indexOf('::', compression + 2) !== -1) return false;
+    if (compression !== -1 && (hostname[compression - 1] === ':' || hostname[compression + 2] === ':')) return false;
+    const leftText = compression === -1 ? hostname : hostname.slice(0, compression);
+    const rightText = compression === -1 ? '' : hostname.slice(compression + 2);
+    const left = leftText ? leftText.split(':') : [];
+    const right = rightText ? rightText.split(':') : [];
+    if (left.some(part => part === '') || right.some(part => part === '')) return false;
+
+    const parseSide = (parts: string[], allowIpv4: boolean): number => {
+        let count = 0;
+        for (let index = 0; index < parts.length; index++) {
+            const part = parts[index];
+            if (part.includes('.')) {
+                if (!allowIpv4 || index !== parts.length - 1 || !isIPv4(part)) return -1;
+                count += 2;
+            } else {
+                if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return -1;
+                count++;
+            }
+        }
+        return count;
+    };
+
+    const supplied = parseSide(left, compression === -1) + parseSide(right, true);
+    if (supplied < 0) return false;
+    return compression === -1 ? supplied === 8 : supplied < 8;
 }
 
 function literalAddress(hostname: string): DnsAddress[] | null {

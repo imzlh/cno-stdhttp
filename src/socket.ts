@@ -78,13 +78,21 @@ export class TcpSocket implements ISocket {
         this.socket.onread = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
             if (data === undefined) {
                 if (err) {
-                    this._readErrHandler?.(err);
-                    Reflect.set(this.socket, 'onread', null);
+                    // Detach terminal readers before invoking user callbacks.
+                    const handler = this._readErrHandler;
+                    this.stopReading();
                     this.notifyInput();   // a write stalled on input must not wait out its deadline
+                    handler?.(err);
                 }
                 return;
             }
-            if (data === null) { this.notifyInput(); this._readCallback?.(null); return; }
+            if (data === null) {
+                const callback = this._readCallback;
+                this.stopReading();
+                this.notifyInput();
+                callback?.(null);
+                return;
+            }
             // TLS: decrypt cipher before delivering (same path as read()).
             if (this.sslPipe) {
                 try {
@@ -104,7 +112,7 @@ export class TcpSocket implements ISocket {
                     // Renegotiation output is fire-and-forget here; a rejected write must
                     // reach the error handler instead of surfacing as an unhandled rejection.
                     if (out) {
-                        this.socket.write(new Uint8Array(out)).catch((e: unknown) => {
+                        this.writeRaw(new Uint8Array(out)).catch((e: unknown) => {
                             this._readErrHandler?.(e instanceof Error ? e : new Error(String(e)));
                         });
                     }
@@ -115,6 +123,7 @@ export class TcpSocket implements ISocket {
                         this._readCallback(plain);
                     }
                 } catch (e) {
+                    this.stopReading();
                     this.notifyInput();
                     this._readErrHandler?.(e instanceof Error ? e : new Error(String(e)));
                     return;
@@ -181,7 +190,7 @@ export class TcpSocket implements ISocket {
             sslPipe.handshake();
             this.notifyInput();   // cipher reached the engine: a stalled SSL_write may proceed
             const out = sslPipe.getOutput();
-            if (out) await this.socket.write(new Uint8Array(out));
+            if (out) await this.writeRaw(new Uint8Array(out));
             const plain = this.sslRead(size);
             if (plain) return plain;
             // No plaintext yet — renegotiation or partial TLS record, loop
@@ -207,27 +216,31 @@ export class TcpSocket implements ISocket {
     }
 
     private writeQueue: Promise<void> = Promise.resolve();
+    private rawWriteQueue: Promise<void> = Promise.resolve();
+
+    private writeRaw(data: Uint8Array): Promise<void> {
+        const run = this.rawWriteQueue.then(
+            () => this.socket.write(data),
+            () => this.socket.write(data),
+        ).then(() => undefined);
+        this.rawWriteQueue = run.catch(() => { /* reported to the owning operation */ });
+        return run;
+    }
 
     private async writeLocked(data: Uint8Array): Promise<void> {
         if (data.length === 0) return;
-        if (!this.sslPipe) { await this.socket.write(data); return; }
+        if (!this.sslPipe) { await this.writeRaw(data); return; }
 
         let offset = 0;
         let stalls = 0;
         let deadline = 0;
         while (offset < data.length) {
-            // close() nulls sslPipe. A write that resumed here after that would fall
-            // through to the plaintext branch on the next call and put cleartext on the
-            // wire, so treat a vanished pipe as the disconnect it is.
+            // A vanished TLS pipe is a disconnect, never a plaintext fallback.
             const sslPipe = this.sslPipe;
             if (!sslPipe) throw Object.assign(new Error('SSL_write failed: socket closed'), { code: 'ECONNRESET' });
 
             const written = sslPipe.write(data.subarray(offset));
-            // SSL_write signals WANT_READ/WANT_WRITE by returning *null*, not 0 (see
-            // CHECK_SSL_ERR in mod_ssl.c). `null === 0` is false and `offset += null`
-            // leaves offset untouched, so the old code span this loop forever with no
-            // await in it: one socket wedged the entire event loop at 100% CPU. Normalise
-            // to a number before any comparison.
+            // Native SSL_write returns null for retryable WANT_READ/WANT_WRITE.
             const n = typeof written === 'number' ? written : 0;
             if (n < 0) throw new Error(`SSL_write failed: ${n}`);
             if (n === 0) {
@@ -322,7 +335,7 @@ export class TcpSocket implements ISocket {
                 this.sslPipe.handshake();
                 this.notifyInput();   // lets a write issued during the handshake retry SSL_write
                 const out = this.sslPipe.getOutput();
-                if (out) await this.socket.write(new Uint8Array(out));
+                if (out) await this.writeRaw(new Uint8Array(out));
             }
         } finally {
             this._handshaking = false;
@@ -339,7 +352,7 @@ export class TcpSocket implements ISocket {
         try {
             this.sslPipe.handshake();
             const initial = this.sslPipe.getOutput();
-            if (initial) await this.socket.write(new Uint8Array(initial));
+            if (initial) await this.writeRaw(new Uint8Array(initial));
 
             const buf = new Uint8Array(READ_SIZE);
             while (!this.sslPipe.handshakeComplete) {
@@ -354,7 +367,7 @@ export class TcpSocket implements ISocket {
                 this.sslPipe.handshake();
                 this.notifyInput();   // lets a write issued during the handshake retry SSL_write
                 const out = this.sslPipe.getOutput();
-                if (out) await this.socket.write(new Uint8Array(out));
+                if (out) await this.writeRaw(new Uint8Array(out));
             }
         } finally {
             this._handshaking = false;
@@ -443,7 +456,7 @@ export class TcpSocket implements ISocket {
     private async flushOutput(): Promise<boolean> {
         const out = this.sslPipe?.getOutput();
         if (!out || out.byteLength === 0) return false;
-        await this.socket.write(new Uint8Array(out));
+        await this.writeRaw(new Uint8Array(out));
         return true;
     }
 

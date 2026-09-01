@@ -2,3 +2,5 @@ types/
 dist.js
 *.jsc
 .npmrc
+node_modules/
+pnpm-lock.yaml
