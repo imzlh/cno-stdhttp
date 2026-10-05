@@ -612,7 +612,17 @@ export class Server {
                     const httpRes = this.toHttpResponse(conn);
                     await this.handler(httpReq, httpRes);
                 }, () => {
-                    // The request timer bounds only idle header waits.
+                    // Reused connections leave the idle keep-alive deadline
+                    // behind once a new request arrives.
+                    if (!firstRequest) {
+                        if (tid !== null) timers.clearTimeout(tid);
+                        tid = this.config.requestTimeout > 0
+                            ? timers.setTimeout(() => { timedOut = true; conn.close(); }, this.config.requestTimeout)
+                            : null;
+                    }
+                }, () => {
+                    // Receiving the body is timed, including paused consumers;
+                    // the application's response work is not.
                     if (tid !== null) { timers.clearTimeout(tid); tid = null; }
                 });
                 firstRequest = false;

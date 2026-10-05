@@ -123,9 +123,10 @@ export class TcpSocket implements ISocket {
                         this._readCallback(plain);
                     }
                 } catch (e) {
+                    const handler = this._readErrHandler;
                     this.stopReading();
                     this.notifyInput();
-                    this._readErrHandler?.(e instanceof Error ? e : new Error(String(e)));
+                    handler?.(e instanceof Error ? e : new Error(String(e)));
                     return;
                 }
             } else {

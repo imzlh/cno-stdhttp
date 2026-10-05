@@ -54,6 +54,7 @@ const MAX_BUFFERED_BODY_BYTES = 16 * 1024 * 1024;
  */
 const BODY_HIGH_WATER_MARK = 1024 * 1024;
 const BODY_RESUME_MARK = 256 * 1024;
+const MAX_RESPONSE_READ_AHEAD_BYTES = 64 * 1024;
 
 function toByteView(buf: CModuleHTTP.BufferSource): Uint8Array {
     if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
@@ -562,6 +563,7 @@ export class H1ServerConnection implements ProtocolConnection {
     private terminalCloseListeners = new Set<() => void>();
     private upgradeLeftover: Uint8Array | null = null;
     private pendingInput: Uint8Array | null = null;
+    private responseReadCleanup: (() => void) | null = null;
     private events: ProtocolConnectionEvents = { onstream: null, onError: null, onClose: null, onGoaway: null, onSettings: null };
     private bodyChunk: Uint8Array[] = [];
     /** Undelivered bytes sitting in bodyChunk; drives backpressure and the hard cap. */
@@ -622,6 +624,41 @@ export class H1ServerConnection implements ProtocolConnection {
         if (this.transportError) throw this.transportError;
     }
 
+    private watchPendingResponse(): () => void {
+        if (this._closed || this._upgraded) return () => {};
+        const chunks = this.pendingInput ? [this.pendingInput] : [];
+        let buffered = this.pendingInput?.byteLength ?? 0;
+        if (buffered >= MAX_RESPONSE_READ_AHEAD_BYTES) return () => {};
+        this.pendingInput = null;
+        let stopped = false;
+        const stop = () => {
+            if (stopped) return;
+            stopped = true;
+            this.socket.stopReading();
+            this.pendingInput = chunks.length ? mergeChunks(chunks) : null;
+            chunks.length = 0;
+            if (this.responseReadCleanup === stop) this.responseReadCleanup = null;
+        };
+        this.responseReadCleanup = stop;
+        // A completed request no longer drives reads, but an idle response must
+        // still observe peer EOF. Preserve bounded pipelined input for the loop.
+        this.socket.onReadable(data => {
+            if (data === null) {
+                stop();
+                this.close();
+                return;
+            }
+            chunks.push(data);
+            buffered += data.byteLength;
+            if (buffered >= MAX_RESPONSE_READ_AHEAD_BYTES) stop();
+        }, err => {
+            this.markTransportError(err);
+            stop();
+            this.close();
+        });
+        return stop;
+    }
+
     private enqueue(u8: Uint8Array) {
         const pending = this.pendingPromise;
         if (pending) {
@@ -668,6 +705,7 @@ export class H1ServerConnection implements ProtocolConnection {
         if (TcpSocket.isDisconnectError(err) && !this.bodyIncomplete()) {
             this.discardBody();
             this.finishBody();
+            this.close();
             return;
         }
         if (TcpSocket.isDisconnectError(err)) {
@@ -685,6 +723,9 @@ export class H1ServerConnection implements ProtocolConnection {
             this.pendingPromise = null;
             pending.reject(err);
         }
+        // Notify paused readers and response waiters before awaiting the handler;
+        // neither can make progress once the peer has gone away.
+        if (TcpSocket.isDisconnectError(err)) this.close();
     }
 
     /**
@@ -826,7 +867,7 @@ export class H1ServerConnection implements ProtocolConnection {
         this.headerValue = null;
     }
 
-    async handleRequest(handler: (req: RawRequest, res: RawResponse) => void | Promise<void>, onHeaders?: () => void): Promise<boolean> {
+    async handleRequest(handler: (req: RawRequest, res: RawResponse) => void | Promise<void>, onHeaders?: () => void, onBodyComplete?: () => void): Promise<boolean> {
         this.requestInProgress = false;
         this.method = ''; this.url = ''; this.reqHeaders = []; this.headerField = ''; this.headerValue = null; this.headersOk = false;
         this.expectBody = false; this.contentLength = 0; this.chunked = false; this.bodyRead = 0;
@@ -979,9 +1020,16 @@ export class H1ServerConnection implements ProtocolConnection {
         }
 
         this.parser.reset(http.REQUEST); this.requestCount++;
+        onBodyComplete?.();
+        const terminal = Promise.withResolvers<void>();
+        const removeClose = this.onTerminalClose(() => terminal.resolve());
+        let stopWatching: (() => void) | undefined;
         try {
-            await handlePromise;
+            stopWatching = this.watchPendingResponse();
+            await Promise.race([handlePromise, terminal.promise]);
         } finally {
+            stopWatching?.();
+            removeClose();
             this.requestInProgress = false;
         }
         // Peer/transport fault ends the connection — do not wait for another request.
@@ -1152,6 +1200,7 @@ export class H1ServerConnection implements ProtocolConnection {
     close(): void {
         if (this._closed) return;
         this._closed = true;
+        this.responseReadCleanup?.();
         this.requestInProgress = false;
         // Pending body/waiters: local close looks like peer EOF to upper layers.
         if (!this.ended) this.failBody(this.transportError ?? this.peerClosedError());
@@ -1164,7 +1213,17 @@ export class H1ServerConnection implements ProtocolConnection {
     destroy(): void { this.close(); }
     /** Last request on this connection: the response must carry Connection: close. */
     disableKeepAlive(): void { this.forceClose = true; this.keepAlive = false; }
-    markUpgraded(): void { this._upgraded = true; this.keepAlive = false; }
+    markUpgraded(): void {
+        this.responseReadCleanup?.();
+        if (this.pendingInput) {
+            this.upgradeLeftover = this.upgradeLeftover
+                ? mergeChunks([this.upgradeLeftover, this.pendingInput])
+                : this.pendingInput;
+            this.pendingInput = null;
+        }
+        this._upgraded = true;
+        this.keepAlive = false;
+    }
     get isUpgraded(): boolean { return this._upgraded; }
     takeUpgradeLeftover(): Uint8Array | null { const v = this.upgradeLeftover; this.upgradeLeftover = null; return v; }
     async readRequest(): Promise<RawRequest> { return { method: this.method, url: this.url, httpVersion: this.requestHttpVersion, headers: this.reqHeaders, body: null }; }
