@@ -88,7 +88,7 @@ function parseContentLength(clHeader: string | undefined, reqHeaders: Array<[str
     const v = clHeader.trim();
     if (!/^\d+$/.test(v)) return -1;
     const n = Number(v);
-    if (!Number.isSafeInteger(n) || n < 0) return -1;
+    if (!Number.isSafeInteger(n)) return -1;
     return n;
 }
 
@@ -333,13 +333,15 @@ export class HttpResponseParser {
 
     constructor() { this.parser = new http.Parser(http.RESPONSE); this.setupCallbacks(); }
 
+    private resetMessage(): void {
+        this.statusCode = 0; this.statusText = ''; this.headers = [];
+        this.currentHeaderField = ''; this.currentHeaderValue = null;
+        this.headersComplete = false; this.interimResponse = false;
+        this.decompressor = null;
+    }
+
     private setupCallbacks(): void {
-        this.parser.onMessageBegin = () => {
-            this.statusCode = 0; this.statusText = ''; this.headers = [];
-            this.currentHeaderField = ''; this.currentHeaderValue = null;
-            this.headersComplete = false; this.interimResponse = false;
-            this.decompressor = null;
-        };
+        this.parser.onMessageBegin = () => this.resetMessage();
         this.parser.onStatus = (buf, off, len) => {
             this.statusText += decodeParserBytes(buf, off, len);
         };
@@ -352,7 +354,7 @@ export class HttpResponseParser {
         };
         this.parser.onHeadersComplete = () => {
             this.commitHeader();
-            const nextStatus = this.parser.state.status;
+            const { status: nextStatus, httpMajor, httpMinor } = this.parser.state;
             if (this.interimResponse && nextStatus >= 200) {
                 this.statusText = '';
                 this.headers = [];
@@ -362,9 +364,7 @@ export class HttpResponseParser {
             this.interimOnly = false;
             if (!this.statusText) this.statusText = strstatus(this.statusCode);
             this.interimResponse = this.statusCode >= 100 && this.statusCode < 200 && this.statusCode !== 101;
-            const major = this.parser.state.httpMajor ?? 1;
-            const minor = this.parser.state.httpMinor ?? 1;
-            this.httpVersion = `${major}.${minor}`;
+            this.httpVersion = `${httpMajor}.${httpMinor}`;
             if (!this.interimResponse) {
                 const ce = this.headers.find(([n]) => n === 'content-encoding');
                 if (ce) this.decompressor = new StreamingDecompressor(ce[1]);
@@ -381,10 +381,7 @@ export class HttpResponseParser {
             if (this.interimResponse) {
                 // 1xx responses are informational; llhttp continues parsing the
                 // final response on the same connection/buffer.
-                this.statusCode = 0; this.statusText = ''; this.headers = [];
-                this.currentHeaderField = ''; this.currentHeaderValue = null;
-                this.headersComplete = false; this.interimResponse = false;
-                this.decompressor = null;
+                this.resetMessage();
                 this.interimOnly = true;
                 return;
             }
@@ -427,9 +424,8 @@ export class HttpResponseParser {
             if (this.interimOnly && !this.headersComplete) {
                 this.parser.reset(http.RESPONSE);
                 this.setupCallbacks();
-                this.statusCode = 0; this.statusText = ''; this.headers = [];
-                this.currentHeaderField = ''; this.currentHeaderValue = null;
-                this.completed = false; this.headersComplete = false;
+                this.resetMessage();
+                this.completed = false;
                 this.interimOnly = false;
             }
             return result;
@@ -458,13 +454,12 @@ export class HttpResponseParser {
     get isHeadersComplete(): boolean { return this.headersComplete; }
 
     reset(): void {
-        this.parser.reset(http.RESPONSE); this.statusCode = 0; this.statusText = '';
-        this.httpVersion = '1.1'; this.headers = []; this.bodyChunks = [];
-        this.currentHeaderField = ''; this.currentHeaderValue = null;
-        this.completed = false; this.headersComplete = false;
-        this.interimResponse = false;
+        this.parser.reset(http.RESPONSE);
+        this.resetMessage();
+        this.httpVersion = '1.1'; this.bodyChunks = [];
+        this.completed = false;
         this.interimOnly = false;
-        this.decompressor = null; this.onComplete = this.onData = this.onError = this.onHeadersComplete = undefined;
+        this.onComplete = this.onData = this.onError = this.onHeadersComplete = undefined;
     }
 }
 
@@ -967,14 +962,11 @@ export class H1ServerConnection implements ProtocolConnection {
                         // A poll proves a consumer exists, which is what licenses the read
                         // loop to block on backpressure instead of buffering without limit.
                         this.bodyPolled = true;
-                        if (this.bodyChunk.length) {
-                            const chunk = this.bodyChunk.shift();
-                            if (chunk !== undefined) {
-                                this.bufferedBody -= chunk.byteLength;
-                                if (this.bufferedBody < 0) this.bufferedBody = 0;
-                                this.wakeDrain();
-                                return Promise.resolve(chunk);
-                            }
+                        const chunk = this.bodyChunk.shift();
+                        if (chunk !== undefined) {
+                            this.bufferedBody -= chunk.byteLength;
+                            this.wakeDrain();
+                            return Promise.resolve(chunk);
                         }
                         if (this.bodyError) return Promise.reject(this.bodyError);
                         if (this.ended) return Promise.resolve(null);
@@ -987,8 +979,8 @@ export class H1ServerConnection implements ProtocolConnection {
             }
 
             if (r.errno !== 0) {
-                const consumed = Number(r.bytesConsumed ?? data.byteLength);
-                if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
+                const consumed = r.bytesConsumed;
+                if (consumed < data.byteLength) {
                     this.pendingInput = data.subarray(consumed);
                 }
                 if (r.name === 'HPE_PAUSED') {
@@ -1130,11 +1122,11 @@ export class H1ServerConnection implements ProtocolConnection {
     async writeData(chunk: Uint8Array | string): Promise<void> {
         this.throwIfTransportDead();
         if (this.responseEnded) throw new Error("Response already ended");
-        if (!this.headersSent) { if (this.requestHttpVersion === "1.0") { this.keepAlive = false; await this.writeHead(200, "OK", []); } else { this.chunkedEncoding = true; await this.writeHead(200, "OK", [['transfer-encoding', 'chunked']]); } }
+        if (!this.headersSent) await this.writeHead(200, "OK", []);
         // Bodyless response: the peer stopped reading at the header block, so any byte
         // written here would be parsed as the head of the next response (Node drops too).
         if (this.bodyless) return;
-        let data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
+        const data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
         // Empty chunked writes are no-ops; zero-length frames terminate the body.
         if (data.byteLength === 0) return;
         if (this.responseContentLength !== null && this.responseBodyBytes + data.byteLength > this.responseContentLength) {
@@ -1145,8 +1137,7 @@ export class H1ServerConnection implements ProtocolConnection {
         // Reserve body bytes before awaiting so concurrent writes share the cap.
         this.responseBodyBytes += data.byteLength;
         try {
-            if (this.chunkedEncoding) await this.socket.write(encodeChunkedFrame(data));
-            else await this.socket.write(data);
+            await this.socket.write(this.chunkedEncoding ? encodeChunkedFrame(data) : data);
         } catch (err) {
             const e = err instanceof Error ? err : new Error(String(err));
             this.markTransportError(e);
@@ -1257,7 +1248,7 @@ class H1ClientConnection implements ProtocolConnection {
     }
 
     private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-        const run = this.requestQueue.then(operation, operation);
+        const run = this.requestQueue.then(operation);
         // Keep the queue usable after a failed exchange while preserving the
         // original rejection for the caller that owns this request.
         this.requestQueue = run.then(() => undefined, () => undefined);
@@ -1268,7 +1259,7 @@ class H1ClientConnection implements ProtocolConnection {
         const previous = this.requestQueue;
         let release!: () => void;
         this.requestQueue = new Promise<void>(resolve => { release = resolve; });
-        await previous.catch(() => { /* queued exchanges keep the slot usable */ });
+        await previous;
         return release;
     }
 
@@ -1358,8 +1349,8 @@ class H1ClientConnection implements ProtocolConnection {
             }
             const result = parser.feed(d);
             if (result) {
-                const consumed = Number(result.bytesConsumed ?? d.byteLength);
-                if (Number.isFinite(consumed) && consumed >= 0 && consumed < d.byteLength) {
+                const consumed = result.bytesConsumed;
+                if (consumed < d.byteLength) {
                     this.pendingInput = d.subarray(consumed);
                 }
             }
