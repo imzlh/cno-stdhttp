@@ -135,8 +135,8 @@ export class Server {
     private listener: CModuleStreams.TCP | CModuleStreams.Pipe | null = null;
     private sslContext: CModuleSSL.Context | null = null;
     private connections = new Set<ProtocolConnection>();
-    /** One entry per in-flight handleConnection(), including protocol handshakes. */
-    private inflight = new Set<Promise<void>>();
+    // Keep transport ownership before a protocol connection exists, including TLS handshakes.
+    private inflight = new Map<Promise<void>, TcpSocket>();
     private listening = false;
     private draining = false;
     private drainResolve: (() => void) | null = null;
@@ -149,14 +149,17 @@ export class Server {
             !(conn instanceof H1ServerConnection && conn.isUpgraded));
     }
 
-    private applyDrainPolicy(conn: ProtocolConnection, force: boolean): void {
-        if (force) {
-            conn.close();
-        } else if (conn instanceof H1ServerConnection || conn instanceof H2Connection) {
+    private applyDrainPolicy(conn: ProtocolConnection): void {
+        if (conn instanceof H1ServerConnection || conn instanceof H2Connection) {
             conn.beginDrain();
         } else {
             conn.goaway();
         }
+    }
+
+    private closeConnections(): void {
+        for (const conn of this.connections) conn.close();
+        for (const socket of this.inflight.values()) socket.close();
     }
 
     private _completeDrain(): void {
@@ -261,7 +264,7 @@ export class Server {
                 return console.error("Accept error:", error);
             }
             if (!client) return;
-            if (this.draining) { client.close(); return; }
+            if (!this.listening || this.draining) { client.close(); return; }
             // Max connections: reject new connections once at capacity (DoS backpressure).
             if (this.config.maxConnections > 0 && this.connections.size >= this.config.maxConnections) {
                 client.close();
@@ -277,7 +280,7 @@ export class Server {
                 tcpSocket.close();
                 if (!TcpSocket.isDisconnectError(e)) console.error("Connection error:", e);
             });
-            this.inflight.add(done);
+            this.inflight.set(done, tcpSocket);
             void done.then(() => {
                 this.inflight.delete(done);
                 if (this.draining && this.inflight.size === 0) this._completeDrain();
@@ -286,9 +289,8 @@ export class Server {
     }
 
     close(): void {
-        if (!this.listening) return;
         this.listening = false;
-        for (const conn of this.connections) conn.close();
+        this.closeConnections();
         this.connections.clear();
         this.listener?.close();
         this.listener = null;
@@ -297,7 +299,7 @@ export class Server {
     private beginDrain(force: boolean): Promise<void> {
         if (this.draining) {
             if (force) {
-                for (const conn of this.connections) conn.close();
+                this.closeConnections();
                 if (this.inflight.size === 0) this._completeDrain();
             }
             return this.drainPromise ?? Promise.resolve();
@@ -305,7 +307,8 @@ export class Server {
         this.draining = true;
         this.drainPromise = new Promise<void>(resolve => { this.drainResolve = resolve; });
         this.listener?.close(); this.listener = null; this.listening = false;
-        for (const conn of this.connections) this.applyDrainPolicy(conn, force);
+        if (force) this.closeConnections();
+        else for (const conn of this.connections) this.applyDrainPolicy(conn);
         this._completeDrain();
         return this.drainPromise;
     }
@@ -369,6 +372,10 @@ export class Server {
         const protoModule = PROTOCOL_MODULES.get(version);
         if (!protoModule) throw new Error(`Unsupported HTTP protocol version: ${version}`);
         const protoConn = await protoModule.server.accept(socket, protoConfig);
+        if (!this.listening) {
+            protoConn.close();
+            return;
+        }
         this.connections.add(protoConn);
 
         // Every exit must release connection tracking so shutdown can drain.
@@ -377,7 +384,7 @@ export class Server {
                 const loop = this.h2RequestLoop(protoConn as H2Connection, socket);
                 // h2RequestLoop installs its close/error listeners synchronously;
                 // apply a racing drain only after those listeners exist.
-                if (this.draining) this.applyDrainPolicy(protoConn, false);
+                if (this.draining) this.applyDrainPolicy(protoConn);
                 await loop;
                 try {
                     protoConn.close();
@@ -396,7 +403,7 @@ export class Server {
                 },
             });
             // Install close tracking before applying a racing drain.
-            if (this.draining) this.applyDrainPolicy(protoConn, false);
+            if (this.draining) this.applyDrainPolicy(protoConn);
 
             await this.h1RequestLoop(protoConn as H1ServerConnection);
             // Upgraded connections remain tracked until protocol or server shutdown.

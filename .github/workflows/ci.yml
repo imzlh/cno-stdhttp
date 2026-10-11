@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Check types and package sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: http
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: http
+      - uses: actions/checkout@v4
+        with:
+          repository: imzlh/circu.js
+          ref: 8df0b515762350a1cb29731655c9ecca39edc098
+          path: circu.js
+          sparse-checkout: types
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: http/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: http/pnpm-lock.yaml
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check native API types
+        run: pnpm run type-check
+      - name: Pack TypeScript sources
+        run: pnpm pack --pack-destination artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cno-http-package
+          path: http/artifacts/*.tgz
+          if-no-files-found: error

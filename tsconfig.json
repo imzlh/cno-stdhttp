@@ -29,7 +29,7 @@
     "include": [
         "src/**/*",
         "ext-h2/**/*.d.ts",
-        "types/**/*.d.ts"
+        "../circu.js/types/**/*.d.ts"
     ],
     "exclude": [
         "node_modules",

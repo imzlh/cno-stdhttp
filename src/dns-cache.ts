@@ -1,20 +1,15 @@
-/**
- * DNS resolution caching with TTL-based expiry.
- *
- * Merged from:
- *   cno/src/module/http/dns-cache.ts  (primary)
- *   cts/src/http/connection.ts       (sync DNS resolution)
- */
+/** DNS resolution caching with TTL-based expiry. */
 
 const dns = import.meta.use("dns");
 const os = import.meta.use("os");
+
+const addressFamily = (family: number) => family === 4 ? os.AF_INET : family === 6 ? os.AF_INET6 : os.AF_UNSPEC;
 
 function isIPv4(hostname: string): boolean {
     if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return false;
     return hostname.split('.').every((part) => {
         if (part.length > 1 && part.startsWith('0')) return false;
-        const value = Number(part);
-        return Number.isInteger(value) && value >= 0 && value <= 255;
+        return Number(part) <= 255;
     });
 }
 
@@ -46,8 +41,10 @@ function isIPv6(hostname: string): boolean {
         return count;
     };
 
-    const supplied = parseSide(left, compression === -1) + parseSide(right, true);
-    if (supplied < 0) return false;
+    const leftCount = parseSide(left, compression === -1);
+    const rightCount = parseSide(right, true);
+    if (leftCount < 0 || rightCount < 0) return false;
+    const supplied = leftCount + rightCount;
     return compression === -1 ? supplied === 8 : supplied < 8;
 }
 
@@ -69,22 +66,14 @@ interface CacheEntry {
 }
 
 const DEFAULT_TTL_MS = 300_000;
-/**
- * How long an empty answer is remembered. Without this, a hostname that resolves to
- * nothing is re-queried on every single connection attempt, so a client loop (or a
- * caller retrying a dead host) turns into unbounded outbound DNS traffic. Short
- * enough that a host coming online is picked up quickly.
- */
+// Briefly cache empty answers to avoid amplifying connection retries into DNS traffic.
 const NEGATIVE_TTL_MS = 5_000;
 
 class DnsCache {
     private cache = new Map<string, CacheEntry>();
     private inflight = new Map<string, Promise<DnsAddress[]>>();
     private readonly maxSize: number;
-    /**
-     * Bumped by invalidate()/clear(). A lookup that started before the bump must not
-     * write its (now known-stale) answer into the cache afterwards.
-     */
+    // Invalidation prevents older queries from repopulating the cache.
     private generation = 0;
 
     constructor(maxSize = 256) {
@@ -103,9 +92,7 @@ class DnsCache {
         if (running) return running;
         const query: Promise<DnsAddress[]> = this.lookup(hostname, key, options?.family ?? 0)
             .finally(() => {
-                // Only retract our own entry: invalidate() may have dropped it and a newer
-                // lookup may already hold the key, and deleting that would strip the
-                // sharing from every caller now waiting on it.
+                // Invalidation may have replaced this query with a newer one.
                 if (this.inflight.get(key) === query) this.inflight.delete(key);
             });
         this.inflight.set(key, query);
@@ -114,26 +101,13 @@ class DnsCache {
 
     private async lookup(hostname: string, key: string, family: number): Promise<DnsAddress[]> {
         const startedAt = this.generation;
-        const addrs = await dns.resolve(hostname, {
-            family: family == 4 ? os.AF_INET : family == 6 ? os.AF_INET6 : os.AF_UNSPEC
-        });
-        if (!addrs?.length) {
-            // Negative result: cache briefly so a retry loop cannot amplify into a
-            // DNS flood, but nowhere near as long as a positive answer.
-            this.store(key, [], NEGATIVE_TTL_MS, startedAt);
-            return addrs ?? [];
-        }
+        const addrs = await dns.resolve(hostname, { family: addressFamily(family) });
         this.store(key, addrs, this.inferTtl(addrs), startedAt);
         return addrs;
     }
 
-    /**
-     * Insert unless the TTL is zero (authoritative "do not cache") or the entry was
-     * invalidated while the query was in flight.
-     */
     private store(key: string, addresses: DnsAddress[], ttl: number, generation = this.generation): void {
-        if (ttl <= 0) return;
-        if (generation !== this.generation) return;
+        if (ttl <= 0 || generation !== this.generation) return;
         this.evictIfFull(key);
         this.cache.set(key, { addresses, expiresAt: Date.now() + ttl });
     }
@@ -145,12 +119,7 @@ class DnsCache {
         const key = `${hostname}:${family}`;
         const cached = this.cache.get(key);
         if (cached && Date.now() < cached.expiresAt) return cached.addresses;
-        // Use sync DNS resolution if available, otherwise return empty
-        const addrs = dns.resolveSync?.(hostname, { family }) ?? [];
-        if (!addrs?.length) {
-            this.store(key, [], NEGATIVE_TTL_MS);
-            return addrs ?? [];
-        }
+        const addrs = dns.resolveSync(hostname, { family: addressFamily(family) });
         this.store(key, addrs, this.inferTtl(addrs));
         return addrs;
     }
@@ -159,9 +128,6 @@ class DnsCache {
         for (const key of this.cache.keys()) {
             if (key.startsWith(hostname + ":")) this.cache.delete(key);
         }
-        // Drop the shared in-flight query too, and bump the generation: otherwise a
-        // lookup already awaiting a reply would write its pre-invalidation answer back
-        // into the cache, silently undoing this call.
         for (const key of this.inflight.keys()) {
             if (key.startsWith(hostname + ":")) this.inflight.delete(key);
         }
@@ -186,10 +152,8 @@ class DnsCache {
     }
 
     private inferTtl(addrs: DnsAddress[]): number {
-        // A resolver-supplied TTL of 0 means "do not cache this"; the old `t > 0` filter
-        // discarded exactly that answer and then fell back to DEFAULT_TTL_MS, pinning a
-        // deliberately uncacheable record for five minutes. Keep zeros so store() can
-        // honour them, and only default when no TTL was reported at all.
+        if (addrs.length === 0) return NEGATIVE_TTL_MS;
+        // TTL zero is authoritative; only absent TTLs use the default.
         const ttls = addrs.map(a => a.ttl).filter((t): t is number => typeof t === "number" && t >= 0);
         return ttls.length > 0 ? Math.min(...ttls) * 1000 : DEFAULT_TTL_MS;
     }

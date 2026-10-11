@@ -4,6 +4,10 @@
     "description": "Low-level HTTP protocol library for cno server",
     "type": "module",
     "main": "src/index.ts",
+    "packageManager": "pnpm@10.17.1",
+    "scripts": {
+        "type-check": "tsc --noEmit"
+    },
     "files": [
         "src",
         "ext-h2",

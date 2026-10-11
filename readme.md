@@ -69,6 +69,12 @@ The package itself has no separate runtime binary. It depends on circu.js
 native modules being available through `import.meta.use()` when executed inside
 the cno runtime.
 
+For a standalone checkout, place `circu.js` beside this repository, then run
+`pnpm install --frozen-lockfile` and `pnpm run type-check`. Only its `types/`
+directory is required. CI checks out a pinned copy of those declarations,
+checks this package, and uploads the TypeScript source tarball produced by
+`pnpm pack`. It does not require a native runtime build or an npm token.
+
 ## HTTP/2
 
 HTTP/2 support is provided by the optional native extension under `ext-h2/`.
