@@ -77,7 +77,7 @@ export function createDecompressor(encoding: string, maxOutput = MAX_DECOMPRESS_
 
 // Wraps a one-shot decompressor, throwing once cumulative output exceeds maxOutput (zip-bomb guard).
 function bombGuard(
-    fn: (d: Uint8Array) => ArrayBuffer,
+    fn: typeof zlib.gunzip,
     maxOutput: number,
     budget: { total: number } = { total: 0 },
 ): (data: Uint8Array) => Uint8Array {
