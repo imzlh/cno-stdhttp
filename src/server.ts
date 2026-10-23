@@ -72,7 +72,7 @@ export interface HttpResponse {
     write(chunk: Uint8Array | string): Promise<void>;
     end(chunk?: Uint8Array | string): Promise<void>;
     upgrade(): UpgradedConnection;
-    /** Subscribe to terminal H1 transport close; returns an unsubscribe function. */
+    /** Subscribe to terminal transport/response-stream close; returns an unsubscribe function. */
     onTerminalClose?(listener: () => void): () => void;
     close(): void;
 }
@@ -589,6 +589,7 @@ export class Server {
             upgrade: () => {
                 throw new Error('HTTP/2 does not support connection upgrade');
             },
+            onTerminalClose: listener => stream.whenClosed(listener),
             close: () => {
                 try {
                     stream.abort();

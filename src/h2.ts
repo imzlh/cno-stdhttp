@@ -331,12 +331,16 @@ export class H2Stream implements ProtocolStream {
         this.headerWaiters.push(cb);
     }
 
-    whenClosed(cb: () => void): void {
+    whenClosed(cb: () => void): () => void {
         if (this.closed) {
             cb();
-            return;
+            return () => {};
         }
         this.closeWaiters.push(cb);
+        return () => {
+            const index = this.closeWaiters.indexOf(cb);
+            if (index !== -1) this.closeWaiters.splice(index, 1);
+        };
     }
 
     whenError(cb: (error: Error) => void): void {
