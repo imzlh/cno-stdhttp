@@ -1,39 +1,10 @@
 /**
- * Protocol abstraction layer — defines the interface that all HTTP protocol
- * implementations (H1, H2, H3) must satisfy.
- *
- * Architecture:
- * ┌─────────────────────────────────────────────────────────────────┐
- * │                   CNO Secondary Wrapping Layer                   │
- * │   (URL→string, Headers→Array, Request/Response→H1 types, etc.)  │
- * └──────────────────────────┬──────────────────────────────────────┘
- *                            │ uses
- *                            ▼
- * ┌─────────────────────────────────────────────────────────────────┐
- * │                    Protocol Interface (this file)                │
- * │   ProtocolClient, ProtocolServer, ProtocolConnection, Stream    │
- * └───────┬──────────────────┬──────────────────┬───────────────────┘
- *         │                  │                  │
- *         ▼                  ▼                  ▼
- * ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
- * │    h1.ts     │  │    h2.ts     │  │    h3.ts     │  (future)
- * │  HTTP/1.x    │  │  HTTP/2      │  │  HTTP/3      │
- * └──────────────┘  └──────────────┘  └──────────────┘
- *         │                  │                  │
- *         └──────────────────┼──────────────────┘
- *                            │ uses
- *                            ▼
- * ┌─────────────────────────────────────────────────────────────────┐
- * │              Shared Transport (socket.ts / connection.ts)       │
- * │                    TcpSocket, ConnectionManager                  │
- * └─────────────────────────────────────────────────────────────────┘
+ * Protocol abstraction shared by the H1/H2/H3 implementations: a ProtocolStream
+ * for one request/response exchange, a ProtocolConnection for a transport, and
+ * client/server modules that produce them.
  */
 
 import type { TcpSocket } from "./socket";
-
-/* ------------------------------------------------------------------ */
-/* Connection-level protocol negotiation                              */
-/* ------------------------------------------------------------------ */
 
 export enum HttpVersion {
     HTTP10 = 0,
@@ -51,10 +22,6 @@ export const ALPN = {
 } as const;
 
 export type AlpnProtocol = typeof ALPN[keyof typeof ALPN];
-
-/* ------------------------------------------------------------------ */
-/* Stream abstraction (protocol-independent request/response)         */
-/* ------------------------------------------------------------------ */
 
 /** Headers as raw [name, value] pairs (low-level, no WebAPI Headers) */
 export type RawHeaders = Array<[string, string]>;
@@ -88,10 +55,6 @@ export interface ProtocolStream {
     close(): void;
 }
 
-/* ------------------------------------------------------------------ */
-/* Protocol connection                                                */
-/* ------------------------------------------------------------------ */
-
 export interface ProtocolConnectionEvents {
     onstream: ((stream: ProtocolStream) => void) | null;
     onError: ((error: Error) => void) | null;
@@ -113,10 +76,6 @@ export interface ProtocolConnection {
     destroy(): void;
 }
 
-/* ------------------------------------------------------------------ */
-/* Protocol client                                                    */
-/* ------------------------------------------------------------------ */
-
 export interface ProtocolClientConfig {
     hostname: string;
     port: number;
@@ -134,10 +93,6 @@ export interface ProtocolClient {
     connect(socket: TcpSocket, config: ProtocolClientConfig): Promise<ProtocolConnection>;
     request(conn: ProtocolConnection, req: RawRequest): Promise<RawResponse>;
 }
-
-/* ------------------------------------------------------------------ */
-/* Protocol server                                                    */
-/* ------------------------------------------------------------------ */
 
 export interface ProtocolServerConfig {
     secure: boolean;
@@ -161,19 +116,11 @@ export interface ProtocolServer {
     negotiate(alpnProtocol?: string): HttpVersion | null;
 }
 
-/* ------------------------------------------------------------------ */
-/* Protocol module registry                                           */
-/* ------------------------------------------------------------------ */
-
 export interface ProtocolModule {
     readonly version: HttpVersion;
     readonly client: ProtocolClient;
     readonly server: ProtocolServer;
 }
-
-/* ------------------------------------------------------------------ */
-/* Utilities                                                          */
-/* ------------------------------------------------------------------ */
 
 export function alpnToProtocol(alpn?: string): HttpVersion | null {
     switch (alpn) {
