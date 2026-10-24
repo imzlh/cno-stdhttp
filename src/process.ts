@@ -1,7 +1,4 @@
-/**
- * HTTP Progress Display
- * Provides graphical progress bar for slow network connections.
- */
+/** Graphical progress bar for slow transfers. */
 
 const engine = import.meta.use("engine");
 const timers = import.meta.use("timers");

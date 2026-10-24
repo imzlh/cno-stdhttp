@@ -1,23 +1,4 @@
-﻿/**
- * @cnojs/http Low-level HTTP protocol library.
- *
- * Core Transport:
- *   socket.ts         TcpSocket: base TCP/SSL I/O, TLS handshake
- *   dns-cache.ts      DnsCache: DNS resolution with TTL caching (async + sync)
- *   raw-connection.ts explicit raw transport entry for SSE/WebSocket-style clients
- *   zlib.ts           gzip/deflate compress/decompress utilities
- *
- * Protocol Layer:
- *   protocol.ts     Protocol interface abstraction (ProtocolClient, ProtocolServer, etc.)
- *   h1.ts           HTTP/1.x protocol (request builder, response parser, server/client connection)
- *
- * Server:
- *   server.ts       Protocol-aware server with ALPN negotiation
- *
- * Utilities:
- *   debug.ts        hexDump: hexadecimal debugging output
- *   process.ts      HttpProgressBar: graphical download progress bar
- */
+﻿/** @cnojs/http — low-level HTTP protocol library: transport (socket, dns-cache, zlib), protocol (protocol, h1, h2), server, utilities. */
 
 // Core Transport
 export { TcpSocket } from "./socket";

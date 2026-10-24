@@ -1,8 +1,4 @@
-/**
- * Load the nghttp2 Session module.
- * Embedded: `@cnojs/http/ext-h2` (CMake CNO_EMBED_EXT_H2).
- * Dynamic:  `ext:h2` (DEF_MODULE when built as .so).
- */
+/** Load the nghttp2 Session module: embedded `@cnojs/http/ext-h2` first, then dynamic `ext:h2`. */
 
 import type CModuleExternalHTTP2 from '../ext-h2/http2';
 
@@ -23,7 +19,8 @@ function isH2Module(value: unknown): value is H2Module {
 }
 
 let cached: H2Module | null | undefined;
-/** Test-only: same path as embed OFF without rebuilding. */
+/** Test-only: routes load through the embed-OFF path without rebuilding.
+ *  Affects only the JS gate; a linked native stays loaded. */
 let forceUnavailable = false;
 
 function tryUse(name: '@cnojs/http/ext-h2' | 'ext:h2'): H2Module | null {
@@ -58,10 +55,6 @@ export function h2Available(): boolean {
     return tryLoadH2() !== null;
 }
 
-/**
- * Test helper: force the load gate to miss (same path as embed OFF).
- * Does not unload a linked native — only the JS gate used by surfaces.
- */
 export function __forceH2Unavailable(force: boolean): void {
     forceUnavailable = force;
     if (force) cached = undefined;

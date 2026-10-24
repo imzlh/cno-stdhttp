@@ -1,12 +1,4 @@
-/**
- * Core Server Layer
- *
- * Accepts connections and serves HTTP/1.x and HTTP/2 (when ext-h2 is linked).
- * Routes via ALPN (TLS) or configured protocols (cleartext h2c when only HTTP/2).
- *
- * Architecture:
- *   TCP accept -> optional TLS+ALPN -> H1 loop or H2 multiplexed streams
- */
+/** Accepts connections and serves HTTP/1.x or HTTP/2 (via ALPN, or h2c prior-knowledge for HTTP/2-only cleartext). */
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type NativeTcpCarrier = { __cnoTcp?: CModuleStreams.Stream };
@@ -94,7 +86,7 @@ interface IProtocol {
 }
 
 /* ------------------------------------------------------------------ */
-/* Protocol registry NOTE: add H3 here when ready                     */
+/* Protocol registry NOTE: add H3 here when ready */
 /* ------------------------------------------------------------------ */
 
 const PROTOCOL_MODULES = new Map<HttpVersion, IProtocol>([
@@ -105,18 +97,8 @@ if (h2Available()) {
 }
 
 /**
- * Can this build actually SERVE `v`, as opposed to merely being configured for it?
- *
- * Availability has to be consulted at three points, not one. Filtering only the
- * advertised ALPN list is not enough: for `protocols: [HTTP2]` on a build without
- * the native, the filtered list is empty, so no ALPN extension is sent, so
- * negotiateProtocol() runs with `undefined` and its no-ALPN fallback used to
- * return HTTP2 regardless — throwing "Unsupported HTTP protocol version: 2"
- * after a completed handshake. Negotiation must know too.
- *
- * HTTP/1.0 is deliberately treated as servable: negotiateProtocol() folds an
- * `http/1.0` ALPN into HTTP11 and serves it with the h1 module, so gating it on
- * a PROTOCOL_MODULES entry it never had would newly break a working config.
+ * Whether this build can actually serve `v`. Must gate negotiation as well as the ALPN list:
+ * an empty ALPN list reaches negotiateProtocol with `undefined`. HTTP/1.0 folds into the h1 module.
  */
 function isServable(v: HttpVersion): boolean {
     if (v === HttpVersion.HTTP10) return PROTOCOL_MODULES.has(HttpVersion.HTTP11);
@@ -171,21 +153,8 @@ export class Server {
     }
 
     /**
-     * The configured protocols minus any this build cannot actually serve. Used for
-     * both the advertised ALPN list and negotiation, so the two cannot disagree —
-     * advertising `h2` we then refuse is what dropped a connection that HTTP/1.1
-     * would have served.
-     *
-     * Public deliberately. A caller that asked for HTTP/2 for a performance or
-     * security reason must be able to find out it did not get it; a dbg() line
-     * nobody reads does not inform them, and throwing from listen() would break a
-     * caller that lists HTTP2 opportunistically and is happy with H1. So the
-     * downgrade is silent on the wire but explicit to the program:
-     *
-     *     server.listen();
-     *     if (!server.effectiveProtocols.includes(HttpVersion.HTTP2)) throw ...;
-     *
-     * Valid before listen() too — availability is fixed at module load.
+     * Configured protocols this build can serve; used for both ALPN and negotiation so they cannot disagree.
+     * Public so a caller can check after listen(); the downgrade is otherwise silent.
      */
     get effectiveProtocols(): HttpVersion[] {
         return this.config.protocols.filter(isServable);
@@ -216,7 +185,6 @@ export class Server {
 
     listen(): void {
         assert(!this.listening, "Server already listening");
-        // Advertise only protocols this build can serve.
         const servable = this.effectiveProtocols;
         const dropped = this.unavailableProtocols;
         if (dropped.length > 0) {
@@ -255,7 +223,6 @@ export class Server {
         assert(this.listener, "Server not listening");
         const listener = this.listener;
         const proto = this.sslContext ? "https" : "http";
-        // Libraries must not write connection diagnostics to application stdout.
         dbg('http.conn', () => `Server listening on ${proto}://${this.config.hostname}:${this.config.port}`);
 
         listener.onconnection = (error: CModuleError.Error | undefined, client: CModuleStreams.Stream | undefined) => {
@@ -265,7 +232,6 @@ export class Server {
             }
             if (!client) return;
             if (!this.listening || this.draining) { client.close(); return; }
-            // Max connections: reject new connections once at capacity (DoS backpressure).
             if (this.config.maxConnections > 0 && this.connections.size >= this.config.maxConnections) {
                 client.close();
                 return;
@@ -276,7 +242,7 @@ export class Server {
             }
             const tcpSocket = new TcpSocket(client);
             const done = this.handleConnection(tcpSocket).catch((e: Error) => {
-                // Handshake/negotiation rejects before registration: close or the fd leaks.
+                // A rejection before registration would otherwise leak the fd.
                 tcpSocket.close();
                 if (!TcpSocket.isDisconnectError(e)) console.error("Connection error:", e);
             });
@@ -334,7 +300,6 @@ export class Server {
     /* -------------------------------------------------------------- */
 
     private async handleConnection(socket: TcpSocket): Promise<void> {
-        // TLS handshake
         if (this.sslContext) {
             await socket.serverHandshake(this.sslContext);
         }
@@ -342,7 +307,6 @@ export class Server {
         const alpnProtocol = socket.alpnProtocol;
         const secure = !!this.sslContext;
 
-        // Negotiate protocol
         const version = this.negotiateProtocol(alpnProtocol);
         if (!version) {
             // Distinguish unsupported builds from negotiation failures.
@@ -382,8 +346,7 @@ export class Server {
         try {
             if (version === HttpVersion.HTTP2) {
                 const loop = this.h2RequestLoop(protoConn as H2Connection, socket);
-                // h2RequestLoop installs its close/error listeners synchronously;
-                // apply a racing drain only after those listeners exist.
+                // The loop installs its listeners synchronously, so drain after it starts.
                 if (this.draining) this.applyDrainPolicy(protoConn);
                 await loop;
                 try {
@@ -394,7 +357,6 @@ export class Server {
                 return;
             }
 
-            // Set up event handlers
             protoConn.on({
                 onError: (err: Error) => console.error(`Protocol error:`, err),
                 onClose: () => {
@@ -402,16 +364,13 @@ export class Server {
                     if (this.draining) this._completeDrain();
                 },
             });
-            // Install close tracking before applying a racing drain.
             if (this.draining) this.applyDrainPolicy(protoConn);
 
             await this.h1RequestLoop(protoConn as H1ServerConnection);
-            // Upgraded connections remain tracked until protocol or server shutdown.
             if (!(protoConn as H1ServerConnection).isUpgraded) {
                 protoConn.close();
             }
         } finally {
-            // Retain upgraded raw sockets for force shutdown.
             const upgraded = version !== HttpVersion.HTTP2
                 && (protoConn as H1ServerConnection).isUpgraded;
             if (!upgraded) this.connections.delete(protoConn);
@@ -421,7 +380,6 @@ export class Server {
 
     private negotiateProtocol(alpnProtocol?: string): HttpVersion | null {
         const allowed = this.config.protocols;
-        // Negotiation requires both configuration and an available implementation.
         const allow = (v: HttpVersion) => allowed.includes(v) && isServable(v);
 
         if (alpnProtocol === ALPN.HTTP2 || alpnProtocol === ALPN.HTTP2C) {
@@ -481,7 +439,7 @@ export class Server {
                     try {
                         stream.abort();
                     } catch {
-                        /* */
+                        //
                     }
                 }).finally(() => {
                     handlers.delete(handler);
@@ -495,7 +453,6 @@ export class Server {
     private async handleH2Stream(stream: H2Stream): Promise<void> {
         await new Promise<void>((resolve, reject) => {
             stream.whenHeaders(() => resolve());
-            // Reject streams closed before request headers to release handlers.
             stream.whenError(reject);
             stream.whenClosed(() => reject(new Error('HTTP/2 stream closed before request headers')));
         });
@@ -514,7 +471,7 @@ export class Server {
         if (authority && !raw.some(([n]) => n.toLowerCase() === 'host')) {
             raw.push(['host', authority]);
         }
-        // Web Request forbids a body on GET/HEAD; keep poll only when needed.
+        // Web Request forbids a body on GET/HEAD.
         const body = (method === 'GET' || method === 'HEAD')
             ? null
             : this.h2BodyPoll(stream);
@@ -548,21 +505,18 @@ export class Server {
                 const informational = status >= 100 && status < 200;
                 if (headersSent && !informational) return;
                 if (!informational) headersSent = true;
-                // Informational H2 headers do not terminate the stream; only
-                // final statuses with a forbidden body use END_STREAM here.
                 bodyless = status === 204 || status === 205 || status === 304;
                 const h2h: Array<[string, string]> = [[':status', String(status)]];
                 for (const [n, v] of headers ?? []) {
                     const lower = n.toLowerCase();
-                    // H2 forbids connection-specific hop-by-hop headers
+                    // H2 forbids connection-specific hop-by-hop headers.
                     if (lower === 'connection' || lower === 'transfer-encoding' || lower === 'keep-alive'
                         || lower === 'proxy-connection' || lower === 'upgrade') {
                         continue;
                     }
                     h2h.push([n, v]);
                 }
-                // Informational headers do not terminate the stream; a final
-                // status may follow before response body data is sent.
+                // Only a final bodyless status ends the stream; informational ones must not.
                 stream.respond(h2h, !informational && bodyless);
             },
             write: async (chunk: Uint8Array | string) => {
@@ -594,7 +548,7 @@ export class Server {
                 try {
                     stream.abort();
                 } catch {
-                    /* */
+                    //
                 }
             },
         };
@@ -611,8 +565,7 @@ export class Server {
             let tid: number | null = timeoutMs > 0
                 ? timers.setTimeout(() => { timedOut = true; conn.close(); }, timeoutMs)
                 : null;
-            // Last allowed request: tell H1 before the handler writes, so the response
-            // announces Connection: close instead of promising a reuse we then refuse.
+            // Tell H1 before the handler writes so the response announces Connection: close.
             if (requestCount + 1 >= this.config.maxRequestsPerConnection) conn.disableKeepAlive();
             try {
                 keepAlive = await conn.handleRequest(async (req: RawRequest, _res: RawResponse) => {
@@ -620,8 +573,7 @@ export class Server {
                     const httpRes = this.toHttpResponse(conn);
                     await this.handler(httpReq, httpRes);
                 }, () => {
-                    // Reused connections leave the idle keep-alive deadline
-                    // behind once a new request arrives.
+                    // A reused connection leaves the idle keep-alive deadline behind.
                     if (!firstRequest) {
                         if (tid !== null) timers.clearTimeout(tid);
                         tid = this.config.requestTimeout > 0
@@ -629,8 +581,7 @@ export class Server {
                             : null;
                     }
                 }, () => {
-                    // Receiving the body is timed, including paused consumers;
-                    // the application's response work is not.
+                    // Timed up to end of body read (including paused consumers), not through the handler's response work.
                     if (tid !== null) { timers.clearTimeout(tid); tid = null; }
                 });
                 firstRequest = false;

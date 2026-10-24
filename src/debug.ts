@@ -1,20 +1,7 @@
-/**
- * Debug logging and hexadecimal dump utilities for @cnojs/http.
- *
- * Uses the same DEBUG env var as cts. Add 'http' (or sub-categories) to enable:
- *   DEBUG=*           — everything (including http)
- *   DEBUG=http        — all http sub-categories
- *   DEBUG=http.conn   — connection / DNS / TLS only
- *   DEBUG=http.fetch  — fetch lifecycle only
- *   DEBUG=http.h1     — HTTP/1.x parser events only
- */
+/** Debug logging and hexadecimal dump utilities for @cnojs/http, gated by the shared DEBUG env var. */
 
 const console = import.meta.use('console');
 const os = import.meta.use('os');
-
-// ---------------------------------------------------------------------------
-// Debug logger — reads the shared DEBUG env var, supports !negation
-// ---------------------------------------------------------------------------
 
 let _init = false;
 const _enabled  = new Set<string>();
@@ -34,7 +21,6 @@ function _lazyInit(): void {
 export function isDebugEnabled(category: string): boolean {
     _lazyInit();
     if (_disabled.has(category) || _disabled.has('http')) return false;
-    // category is e.g. 'http.conn' — also check parent 'http' and wildcard '*'
     const parent = category.includes('.') ? category.slice(0, category.indexOf('.')) : null;
     return _enabled.has('*') || _enabled.has(category) || (parent !== null && _enabled.has(parent));
 }
@@ -45,12 +31,6 @@ export function dbg(category: string, msg: string | (() => string), ...rest: unk
     console.log(`\x1b[2m[${category}]\x1b[0m ${text}`, ...rest);
 }
 
-/**
- * Hexadecimal debugging output function.
- * @param prefix  Output prefix (e.g. module name)
- * @param data    Data to dump (Buffer, Uint8Array, ArrayBuffer, or number[])
- * @param options Display options
- */
 export function hexDump(
     prefix: string,
     data: Uint8Array | number[] | ArrayBuffer,

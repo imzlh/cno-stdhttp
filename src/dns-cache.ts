@@ -66,14 +66,13 @@ interface CacheEntry {
 }
 
 const DEFAULT_TTL_MS = 300_000;
-// Briefly cache empty answers to avoid amplifying connection retries into DNS traffic.
 const NEGATIVE_TTL_MS = 5_000;
 
 class DnsCache {
     private cache = new Map<string, CacheEntry>();
     private inflight = new Map<string, Promise<DnsAddress[]>>();
     private readonly maxSize: number;
-    // Invalidation prevents older queries from repopulating the cache.
+    // Bumped on invalidate/clear so in-flight queries started earlier cannot repopulate the cache.
     private generation = 0;
 
     constructor(maxSize = 256) {
@@ -87,12 +86,10 @@ class DnsCache {
         const key = `${hostname}:${options?.family ?? 0}`;
         const cached = this.cache.get(key);
         if (cached && Date.now() < cached.expiresAt) return cached.addresses;
-        // Concurrent misses on the same key share one query instead of each issuing its own.
         const running = this.inflight.get(key);
         if (running) return running;
         const query: Promise<DnsAddress[]> = this.lookup(hostname, key, options?.family ?? 0)
             .finally(() => {
-                // Invalidation may have replaced this query with a newer one.
                 if (this.inflight.get(key) === query) this.inflight.delete(key);
             });
         this.inflight.set(key, query);
@@ -153,7 +150,7 @@ class DnsCache {
 
     private inferTtl(addrs: DnsAddress[]): number {
         if (addrs.length === 0) return NEGATIVE_TTL_MS;
-        // TTL zero is authoritative; only absent TTLs use the default.
+        // TTL 0 is authoritative: it must expire immediately, so only absent TTLs fall back to the default.
         const ttls = addrs.map(a => a.ttl).filter((t): t is number => typeof t === "number" && t >= 0);
         return ttls.length > 0 ? Math.min(...ttls) * 1000 : DEFAULT_TTL_MS;
     }

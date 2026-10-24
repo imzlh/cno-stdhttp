@@ -1,13 +1,9 @@
-/**
- * Shared zlib utilities for HTTP Content-Encoding support.
- * Used by both client (decompress) and server (compress).
- */
+/** Shared zlib utilities for HTTP Content-Encoding. */
 
 const zlib = import.meta.use("zlib");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
-// Zip-bomb guard: cumulative decompressed output per stream may not exceed this.
 export const MAX_DECOMPRESS_BYTES = 256 * 1024 * 1024;
 
 /** Parse Accept-Encoding header into ordered list of supported algorithms. */
@@ -66,7 +62,6 @@ export function createDecompressor(encoding: string, maxOutput = MAX_DECOMPRESS_
             const before = budget.total;
             try { return inflate(data); }
             catch {
-                // Roll back the failed attempt's charge; it produced nothing usable.
                 budget.total = before;
                 return inflateRaw(data);
             }
@@ -75,7 +70,7 @@ export function createDecompressor(encoding: string, maxOutput = MAX_DECOMPRESS_
     return null;
 }
 
-// Wraps a one-shot decompressor, throwing once cumulative output exceeds maxOutput (zip-bomb guard).
+// Throws once cumulative output exceeds maxOutput.
 function bombGuard(
     fn: typeof zlib.gunzip,
     maxOutput: number,
@@ -114,8 +109,8 @@ export class StreamingDecompressor {
             if (this._total > this._maxOutput) throw new Error(`decompressed output exceeds ${this._maxOutput} bytes`);
             return out;
         } catch (err) {
-            // Raw-deflate retry is only sound on the first chunk. Restarting mid-stream
-            // would decode this chunk against a fresh window and emit garbage.
+            // Raw-deflate retry is only sound on the first chunk: restarting mid-stream
+            // would inflate against a fresh window and emit garbage.
             if (this._encoding === 'deflate' && !this._deflateRawFallback && !this._produced) {
                 this._deflateRawFallback = true;
                 this._stream = zlib.createInflateRaw();
@@ -131,20 +126,13 @@ export class StreamingDecompressor {
     get encoding(): string { return this._encoding; }
     get isActive(): boolean { return this._stream !== null; }
 
-    /**
-     * End of compressed input: validate the stream trailer. A body cut short mid-stream
-     * inflates to a short-but-plausible result, so without this a truncated (or
-     * deliberately clipped) response body is indistinguishable from a complete one.
-     * Throws when the stream is incomplete or corrupt; safe to call more than once.
-     */
+    /** Validates the stream trailer; a body cut short inflates to a plausible result, so this is the only truncation check. */
     finish(): Uint8Array {
         const stream = this._stream;
         if (!stream || this._finished) return new Uint8Array(0);
         this._finished = true;
-        // circu.js marks an inflater finished as soon as inflate() sees the trailer,
-        // so a following finish() is a duplicate and throws. Test the state instead
-        // of matching the thrown message: the message is not part of any contract and
-        // a reworded throw would silently turn this back into a hard error.
+        // circu.js marks the inflater finished as soon as inflate() sees the trailer, so
+        // finish() would then throw; check the state, not the error message.
         if (stream.finished) return new Uint8Array(0);
         const out = new Uint8Array(stream.finish());
         this._total += out.length;

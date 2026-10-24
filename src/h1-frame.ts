@@ -1,9 +1,4 @@
-/**
- * Pure HTTP/1.x framing + connection policy — no I/O.
- *
- * Shared by H1ServerConnection, Node HTTPS, and Node http(s) client so wire
- * bytes and keep-alive decisions stay identical across stacks.
- */
+/** Pure HTTP/1.x framing + connection policy (no I/O), shared by the server and Node client stacks. */
 
 const engine = import.meta.use('engine');
 
@@ -13,14 +8,11 @@ const CRLF = engine.encodeString('\r\n');
 const CHUNKED_TRAILER = engine.encodeString('0\r\n\r\n');
 
 /**
- * Start-line + header block + final blank line.
- * `headerBlock` is zero or more `Name: value\r\n` lines (no trailing blank).
+ * Start line plus a header block (`Name: value\r\n` lines, optional trailing blank) and the final blank line.
  */
 export function formatHead(startLine: string, headerBlock = ''): string {
-    // The start line carries user-supplied pieces (reason phrase, method, request
-    // target). A CR/LF/NUL in any of them would terminate the line early and let
-    // the rest be read as extra headers or a second response — classic response
-    // splitting. Node throws ERR_INVALID_CHAR here; reject rather than emit.
+    // The start line carries user-supplied method/target/reason phrase; a CR, LF or NUL
+    // there would split the message (response splitting). Node throws ERR_INVALID_CHAR.
     assertNoControlChars(startLine);
     const block = !headerBlock
         ? ''
@@ -120,7 +112,6 @@ export function connectionTokens(header: string | null | undefined): string[] {
 
 /**
  * Whether the peer wants keep-alive after this message.
- * HTTP/1.1 defaults open; HTTP/1.0 needs explicit keep-alive; `close` wins.
  */
 export function wantsKeepAlive(
     httpVersion: string,
