@@ -313,6 +313,18 @@ static int cb_frame_recv(nghttp2_session *ng, const nghttp2_frame *frame,
         JS_FreeValue(ctx, argv[0]); JS_FreeValue(ctx, argv[1]);
         break;
     }
+    case NGHTTP2_DATA: {
+        /* END_STREAM is a per-frame flag; cb_data_chunk may see a frame in
+         * several pieces, so the end is reported once here, after the last. */
+        if (!(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) break;
+        JSValue argv[3] = { JS_NewInt32(ctx, sid),
+                            JS_NewUint8ArrayCopy(ctx, (const uint8_t *)"", 0),
+                            JS_TRUE };
+        if (JS_IsException(argv[1])) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        call_rc = h2_call_cb(ctx, s->callbacks[H2_CB_DATA], 3, argv);
+        for (int i = 0; i < 3; i++) JS_FreeValue(ctx, argv[i]);
+        break;
+    }
     case NGHTTP2_PUSH_PROMISE: {
         int32_t       pid = frame->push_promise.promised_stream_id;
         H2StreamData *sd  = nghttp2_session_get_stream_user_data(ng, pid);
@@ -374,12 +386,14 @@ static int cb_frame_not_send(nghttp2_session *ng,
 
 static int cb_data_chunk(nghttp2_session *ng, uint8_t flags, int32_t sid,
                           const uint8_t *data, size_t len, void *ud) {
-    (void)ng;
+    (void)ng; (void)flags;
     H2Session *s   = ud;
     JSContext *ctx = s->ctx;
+    /* flags describes the whole DATA frame, not this chunk: END_STREAM is
+     * delivered from cb_frame_recv once the frame is complete. */
     JSValue argv[3] = { JS_NewInt32(ctx, sid),
                         JS_NewUint8ArrayCopy(ctx, data, len),
-                        JS_NewBool(ctx, flags & NGHTTP2_FLAG_END_STREAM) };
+                        JS_FALSE };
     int call_rc = h2_call_cb(ctx, s->callbacks[H2_CB_DATA], 3, argv);
     for (int i = 0; i < 3; i++) JS_FreeValue(ctx, argv[i]);
     return call_rc < 0 ? NGHTTP2_ERR_CALLBACK_FAILURE : 0;
@@ -425,8 +439,20 @@ static void h2session_finalizer(JSRuntime *rt, JSValue val) {
     free(s);
 }
 
+static void h2session_gc_mark(JSRuntime *rt, JSValueConst val,
+                              JS_MarkFunc *mark_func) {
+    H2Session *s = JS_GetOpaque(val, h2session_class_id);
+    if (!s) return;
+    for (int i = 0; i < H2_CB_COUNT; i++)
+        JS_MarkValue(rt, s->callbacks[i], mark_func);
+    for (H2StreamData *sd = s->streams; sd; sd = sd->next) {
+        JS_MarkValue(rt, sd->userdata, mark_func);
+        JS_MarkValue(rt, sd->headers, mark_func);
+    }
+}
+
 static JSClassDef h2session_class = {
-    "Session", .finalizer = h2session_finalizer
+    "Session", .finalizer = h2session_finalizer, .gc_mark = h2session_gc_mark
 };
 
 /* ── Constructor ──────────────────────────────────────────────── */
