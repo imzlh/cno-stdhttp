@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: imzlh/circu.js
-          ref: 8df0b515762350a1cb29731655c9ecca39edc098
+          ref: d4ad1b5ae718262659cf85053d54aee8f49af979
           path: circu.js
           sparse-checkout: types
       - uses: pnpm/action-setup@v4
